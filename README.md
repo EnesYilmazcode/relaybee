@@ -66,23 +66,92 @@ then waits, so it holds up to about two minutes.
 You can answer other people's `claude-code` requests from your own machine. The whole setup is
 one line. Tell Claude Code or Codex:
 
-> Connect to https://relaybee.vercel.app and run as a Relaybee supporter.
+> Set up this machine as a Relaybee supporter node using the setup docs at
+> https://relaybee.vercel.app/llms.txt. I have read and accepted the supporter terms on that page.
+> Run the setup, then tell me the pid and the stop command.
 
-Claude fetches the site's instructions from [`/llms.txt`](https://relaybee.vercel.app/llms.txt),
-mints its own key, and starts a background loop. There is nothing to paste and no key to copy.
-Under the hood it just does this, over and over until you stop it:
+It needs `ANTHROPIC_API_KEY` exported first. That is not incidental. Supporter nodes answer on API
+billing and never on your Claude login, because a consumer seat is licensed to its holder for their
+own use and answering strangers is the part it does not cover. `--bare` reads the API key and never
+touches OAuth or the keychain, so a node cannot spend a Pro/Max seat even by accident. Cost is bounded at both ends: `--max-budget-usd` caps a single job, and the loop stops itself after
+`MAXJOBS` jobs (100 by default, set `RELAYBEE_MAX_JOBS` to change it) so the total is finite too.
+
+Claude reads [`/llms.txt`](https://relaybee.vercel.app/llms.txt), mints its own key, and leaves a
+loop polling in the background. There is nothing to paste and no key to copy. It is a one-minute
+setup, not a job that occupies the session you ran it from. Under the hood the loop does this until
+you stop it:
 
 1. It long-polls `POST /api/work/next` for the next job.
-2. It answers the conversation in the job's messages itself.
+2. It answers the job's messages with a separate headless `claude -p`, not the session you set it
+   up from. No caller's prompt is ever read into that session's context.
 3. It sends the answer back with `POST /api/work/complete`, then polls again.
+
+It needs `bash` and `jq`. On Windows that means Git Bash, which is what Claude Code's Bash tool
+already uses, plus `winget install jqlang.jq`. Before reporting success it asks
+`GET /api/work/status` whether the relay can actually see the node, because a pid proves nothing on
+its own: a background shell that died a second later still leaves you one.
+
+That wording is deliberate and was measured rather than guessed, against real headless agents
+(`test/agent-harness.mts` boots the API and serves this repo's own `public/` so trials never touch
+production). "Connect to … and fetch `/llms.txt` and follow it" was refused every time: it is the
+shape of a prompt injection, so agents decline before reading anything. Describing the page as
+setup docs got them to read it, and carrying your acceptance of the supporter terms is what stops
+them stalling to ask a human who is not there mid-setup.
 
 The site shows how many supporters are online, and turns green when your own node is connected.
 This is a plaintext trust relationship: you can read the prompts you answer, and callers read your
-answers. Two things worth reading before you run one, both in
-[`/llms.txt`](https://relaybee.vercel.app/llms.txt): the prompt is a stranger's text going straight
-to your agent, so run it somewhere it cannot reach anything private, and a consumer subscription is
-licensed to its holder, so answering other people with it may fall outside your plan. (If your tool
-cannot fetch a URL, the supporter view also has the full steps to paste by hand.)
+answers. (If your tool cannot fetch a URL, the supporter view also has the full steps to paste by
+hand.)
+
+### What the answering process can reach
+
+Every job is a stranger's prompt going into an agent on your machine, so the process that reads it
+is contained five ways, and the deny list is the weakest of them.
+
+```mermaid
+flowchart LR
+  P["A stranger's prompt"] --> G
+
+  subgraph G ["claude -p, in a fresh mktemp -d"]
+    direction TB
+    B1["--bare<br/>API key only. No CLAUDE.md,<br/>hooks, plugins or keychain"]
+    B2["--safe-mode<br/>No MCP servers, skills,<br/>plugins or custom agents"]
+    B3["--strict-mcp-config<br/>No MCP config reachable"]
+    B4["--disallowedTools<br/>Every built-in denied by name"]
+    B5["timeout 120<br/>One job cannot wedge the node"]
+  end
+
+  G --> A["Answer text, nothing else"]
+  X["Your mail, files, shell,<br/>Claude subscription"] -. unreachable .-> G
+```
+
+The deny list alone was not enough, and that was measured rather than assumed. The previous version
+named fourteen tools, and on a stock install a caller's prompt still arrived holding `ToolSearch`,
+`Skill`, `Workflow`, `ScheduleWakeup` and `ReportFindings`. Through `ToolSearch` it could load this
+machine's own `mcp__claude_ai_Gmail__search_threads` and Google Calendar tools by name. A deny list
+can only block what it names, and it cannot name a tool that did not exist when it was written.
+`--safe-mode --strict-mcp-config` is what actually closes that, because it removes the surface
+instead of enumerating it.
+
+So the worker does not trust any of it on faith. Before it takes a single job it plants a canary
+file, runs the exact command the loop will use, and refuses to start if the answer contains the
+canary:
+
+```
+supporter start
+  |
+  +-- ANTHROPIC_API_KEY set? ------ no --> exit, tell the human why
+  |                                yes
+  +-- mint key, mktemp -d
+  |
+  +-- plant canary.txt, ask the sandboxed agent to read it
+  |         |
+  |         +-- canary came back --> REFUSING TO START
+  |         +-- contained --------> poll for work
+```
+
+A deny list that has quietly gone stale looks identical to one that works, right up until a caller
+finds the gap. This turns that into a loud refusal at startup instead.
 
 ## How it works
 

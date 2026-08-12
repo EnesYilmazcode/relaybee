@@ -27,15 +27,29 @@ path through the API and is documented on the docs page; it just has no UI.
   localStorage means any XSS is key theft. Keep JS/CSS in external files.
 - **The relay is a disclosed plaintext-trust relationship.** Supporters see prompts, users see
   answers, and the two risks a supporter carries are that the prompt is untrusted input reaching
-  their agent and that a consumer subscription is licensed to its holder. As of 2026-08-02 that
-  disclosure lives in `public/llms.txt` only; it came off the homepage by the owner's decision. That
-  is still the file the one-liner makes an agent fetch and follow before it runs anything, so the
-  note sits on the path a supporter actually takes. **Keep it there**, and keep the connect line
-  pointing at it; if that link goes, nothing discloses anything. Anything the board concludes about supporter
-  risk belongs where a supporter will read it, not only in `PROJECT.md`.
+  their agent and that a consumer subscription is licensed to its holder. The full disclosure lives
+  in `public/llms.txt`, which is the file the connect line makes an agent read before it runs
+  anything, so the note sits on the path a supporter actually takes. **Keep it there**, and keep the
+  connect line pointing at it; if that link goes, nothing discloses anything. Anything the board
+  concludes about supporter risk belongs where a supporter will read it, not only in `PROJECT.md`.
+  The long note came off the homepage on 2026-08-02 by the owner's decision. On 2026-08-04 a single
+  sentence went back, and only because the connect line now says "I have read and accepted the
+  supporter terms" on the reader's behalf — an agent stalls without it, waiting for a human who is
+  not there mid-setup. That claim has to be made true somewhere the human sees before copying, so
+  the homepage names the two risks in one line and links `/llms.txt` for the rest. If the connect
+  line ever stops asserting acceptance, this sentence can come off again.
 
 ## Testing & deploy
 
+- **Supporter onboarding is measured, not argued.** `test/agent-harness.mts <port>` boots the real
+  edge handlers plus `public/` on a local port and rewrites every production URL out of the files
+  it serves, so a real `claude -p` can be pointed at it without any chance of answering
+  production's callers. `/_h/log` reports which endpoints a trial actually hit, which is the only
+  trustworthy signal: agents report "supporter is running, pid 20196" for nodes that never came
+  up. It is deliberately not part of `npm run check` (it needs a live agent and real minutes).
+  Run it before changing the connect line in `app.js` or the wording of `llms.txt` — both are
+  load-bearing and the obvious phrasing measurably does not work. An agent's fetch tool caches,
+  so use a fresh port per batch or you are measuring the previous edit.
 - `npm run check` = `tsc --noEmit` + `test/smoke.mts` + `test/upstash.mts` (the real Upstash
   path against a fake REST server that counts Redis commands, so cost claims are asserted, not
   argued). It must pass before any commit. Add assertions when you add behavior. Exact counts

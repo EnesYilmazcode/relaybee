@@ -52,20 +52,27 @@
   then holds for up to about 110 seconds, which is the only window long enough to actually receive
   an answer.</p>
 
-  <div class="snippet">
-    <button class="copy" aria-label="Copy this snippet">copy</button>
+  <div class="tabs">
+    <div class="tablist" role="tablist" aria-label="Shell for the relay call">
+      <button type="button" role="tab" id="t-relay-curl" aria-controls="p-relay-curl" aria-selected="true">curl</button>
+      <button type="button" role="tab" id="t-relay-pwsh" aria-controls="p-relay-pwsh" aria-selected="false" tabindex="-1">PowerShell</button>
+    </div>
+
+    <div role="tabpanel" id="p-relay-curl" aria-labelledby="t-relay-curl">
+      <div class="snippet">
+        <button class="copy" aria-label="Copy this snippet">copy</button>
 <pre data-fill>curl -N __ORIGIN__/api/v1/chat/completions \
   -H "Authorization: Bearer __KEY__" \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-code",
        "stream":true,
        "messages":[{"role":"user","content":"Say hello in one sentence."}]}'</pre>
-  </div>
+      </div>
+    </div>
 
-  <details class="aside">
-    <summary>On Windows PowerShell, where those quotes will not survive</summary>
-    <div class="snippet">
-      <button class="copy" aria-label="Copy this snippet">copy</button>
+    <div role="tabpanel" id="p-relay-pwsh" aria-labelledby="t-relay-pwsh" hidden>
+      <div class="snippet">
+        <button class="copy" aria-label="Copy this snippet">copy</button>
 <pre data-fill>$body = @{
   model    = 'claude-code'
   stream   = $true
@@ -76,10 +83,12 @@ curl.exe -N __ORIGIN__/api/v1/chat/completions `
   -H "Authorization: Bearer __KEY__" `
   -H "Content-Type: application/json" `
   -d $body</pre>
+      </div>
+      <p class="hint">Use <code>curl.exe</code>, not <code>curl</code>: the bare name is an alias for
+      Invoke-WebRequest, which takes different flags. The single quotes in the curl version do not
+      survive PowerShell, which is why the body is built as an object here.</p>
     </div>
-    <p class="hint">Use <code>curl.exe</code>, not <code>curl</code>: the bare name is an alias for
-    Invoke-WebRequest, which takes different flags.</p>
-  </details>
+  </div>
 
   <h2>2. Or run it right here</h2>
   <p>Same request, same key, sent from this page. If it answers, your key works.</p>
@@ -98,9 +107,16 @@ curl.exe -N __ORIGIN__/api/v1/chat/completions `
   <p>Relaybee speaks OpenAI's wire format, so any OpenAI client works. Point <code>baseURL</code> at
   Relaybee and pass your key where the OpenAI key would go.</p>
 
-  <h3>JavaScript</h3>
-  <div class="snippet">
-    <button class="copy" aria-label="Copy this snippet">copy</button>
+  <div class="tabs">
+    <div class="tablist" role="tablist" aria-label="Language">
+      <button type="button" role="tab" id="t-code-js" aria-controls="p-code-js" aria-selected="true">JavaScript</button>
+      <button type="button" role="tab" id="t-code-py" aria-controls="p-code-py" aria-selected="false" tabindex="-1">Python</button>
+      <button type="button" role="tab" id="t-code-env" aria-controls="p-code-env" aria-selected="false" tabindex="-1">Environment</button>
+    </div>
+
+    <div role="tabpanel" id="p-code-js" aria-labelledby="t-code-js">
+      <div class="snippet">
+        <button class="copy" aria-label="Copy this snippet">copy</button>
 <pre data-fill>import OpenAI from 'openai'
 
 const relaybee = new OpenAI({
@@ -117,11 +133,12 @@ const stream = await relaybee.chat.completions.create({
 for await (const part of stream) {
   process.stdout.write(part.choices[0]?.delta?.content ?? '')
 }</pre>
-  </div>
+      </div>
+    </div>
 
-  <h3>Python</h3>
-  <div class="snippet">
-    <button class="copy" aria-label="Copy this snippet">copy</button>
+    <div role="tabpanel" id="p-code-py" aria-labelledby="t-code-py" hidden>
+      <div class="snippet">
+        <button class="copy" aria-label="Copy this snippet">copy</button>
 <pre data-fill>from openai import OpenAI
 
 relaybee = OpenAI(base_url="__ORIGIN__/api/v1", api_key="__KEY__")
@@ -134,14 +151,17 @@ stream = relaybee.chat.completions.create(
 
 for part in stream:
     print(part.choices[0].delta.content or "", end="", flush=True)</pre>
-  </div>
+      </div>
+    </div>
 
-  <h3>Environment variables</h3>
-  <p>Most tools that already speak OpenAI need no code at all, just these two.</p>
-  <div class="snippet">
-    <button class="copy" aria-label="Copy this snippet">copy</button>
+    <div role="tabpanel" id="p-code-env" aria-labelledby="t-code-env" hidden>
+      <p>Most tools that already speak OpenAI need no code at all, just these two.</p>
+      <div class="snippet">
+        <button class="copy" aria-label="Copy this snippet">copy</button>
 <pre data-fill>OPENAI_BASE_URL=__ORIGIN__/api/v1
 OPENAI_API_KEY=__KEY__</pre>
+      </div>
+    </div>
   </div>
 
   <h2>4. Bringing your own provider key</h2>
@@ -150,8 +170,15 @@ OPENAI_API_KEY=__KEY__</pre>
   that only your Relaybee key can open. Two calls, seal once and then send that blob on every
   request.</p>
 
-  <div class="snippet">
-    <button class="copy" aria-label="Copy this snippet">copy</button>
+  <div class="tabs">
+    <div class="tablist" role="tablist" aria-label="Shell for the bring-your-own-key calls">
+      <button type="button" role="tab" id="t-byok-curl" aria-controls="p-byok-curl" aria-selected="true">curl</button>
+      <button type="button" role="tab" id="t-byok-pwsh" aria-controls="p-byok-pwsh" aria-selected="false" tabindex="-1">PowerShell</button>
+    </div>
+
+    <div role="tabpanel" id="p-byok-curl" aria-labelledby="t-byok-curl">
+      <div class="snippet">
+        <button class="copy" aria-label="Copy this snippet">copy</button>
 <pre data-fill># 1. Seal your provider key. Keep the "connection" value it returns.
 curl __ORIGIN__/api/connect \
   -H "Authorization: Bearer __KEY__" \
@@ -165,6 +192,33 @@ curl __ORIGIN__/api/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"anthropic/claude-opus-5",
        "messages":[{"role":"user","content":"hi"}]}'</pre>
+      </div>
+    </div>
+
+    <div role="tabpanel" id="p-byok-pwsh" aria-labelledby="t-byok-pwsh" hidden>
+      <div class="snippet">
+        <button class="copy" aria-label="Copy this snippet">copy</button>
+<pre data-fill># 1. Seal your provider key, and keep the connection value it returns.
+$seal = @{ provider = 'anthropic'; apiKey = 'sk-ant-...'; label = 'personal' } | ConvertTo-Json
+
+$conn = (curl.exe __ORIGIN__/api/connect `
+  -H "Authorization: Bearer __KEY__" `
+  -H "Content-Type: application/json" `
+  -d $seal | ConvertFrom-Json).connection
+
+# 2. Send it on every call, in a header.
+$body = @{
+  model    = 'anthropic/claude-opus-5'
+  messages = @(@{ role = 'user'; content = 'hi' })
+} | ConvertTo-Json -Depth 5
+
+curl.exe __ORIGIN__/api/v1/chat/completions `
+  -H "Authorization: Bearer __KEY__" `
+  -H "X-Relaybee-Connection: $conn" `
+  -H "Content-Type: application/json" `
+  -d $body</pre>
+      </div>
+    </div>
   </div>
 
   <p>Comma-separate up to 8 connections in that header to pool them. Relaybee starts at a random one

@@ -578,6 +578,57 @@ t('the worker script reads the HTTP status, not just the body', /%\{http_code\}/
 t('the worker script backs off instead of spinning on an error', /sleep 15/.test(llms))
 t('the worker script checks jq is present before relying on it', /command -v jq/.test(llms))
 t('the worker script always delivers an answer, even a failed one', /could not produce an answer/.test(llms))
+// The answering process runs a stranger's text. It gets no tools and an empty
+// directory. This was a live hole, not a theoretical one: with a plain
+// `claude -p` a job saying "read ./notes.txt and reply with the contents" got
+// them with no permission prompt, because the process inherits whatever the
+// supporter's own settings already allow. Verified both ways against a canary
+// file. Note an empty --allowedTools does NOT deny anything; only the deny list
+// does, so pin the flag that actually works.
+t('the worker denies tools to the process that reads a stranger prompt',
+  /--disallowedTools/.test(llms) && /\bBash\b/.test(llms) && /\bRead\b/.test(llms) && /WebFetch/.test(llms))
+// The deny list is a deny list: it blocks only what it names, and it cannot
+// name a tool that did not exist when it was written. Not theoretical. Measured
+// on a stock install against the previous 14-name list, a caller's prompt still
+// had ToolSearch, Skill, Workflow, ScheduleWakeup and ReportFindings, and
+// through ToolSearch it could load this machine's own
+// mcp__claude_ai_Gmail__search_threads and Google_Calendar tools by name. Pin
+// the names that survived, so shrinking the list back trips a test.
+t('the deny list covers the tools that survived the previous one',
+  /ToolSearch/.test(llms) && /Skill/.test(llms) && /Workflow/.test(llms))
+// The real fix is not a longer list. --safe-mode drops MCP servers, skills,
+// plugins and custom agents, and --strict-mcp-config makes sure no MCP config
+// is reachable at all. Verified: with both, ToolSearch returns no Gmail match.
+t('the worker removes the MCP and skill surface rather than listing it',
+  /--safe-mode/.test(llms) && /--strict-mcp-config/.test(llms))
+// A stranger's prompt that trips a permission check makes `claude -p` sit
+// waiting for a grant that never comes in a headless loop. The job is already
+// off the queue by then, so without a timeout one crafted prompt wedges the
+// node for good and eats the caller's whole window. Note --permission-mode
+// dontAsk is the wrong fix and was tested: it does not fail closed, it
+// auto-approved a CronCreate from a stranger's prompt.
+t('a single job cannot wedge the node', /timeout 120 claude/.test(llms))
+t('each job has a spend ceiling', /--max-budget-usd/.test(llms))
+// A per-job cap with no total is still an unbounded commitment, and every
+// Sonnet trial against the hardened file stopped to say so before running it.
+// The loop stops itself after MAXJOBS, so the spend a supporter agrees to is
+// finite at both ends.
+t('the total spend is bounded, not just the per-job spend',
+  /MAXJOBS/.test(llms) && /RELAYBEE_MAX_JOBS/.test(llms))
+// Containment is proved, not asserted. A stale deny list looks exactly like a
+// working one until a caller finds the gap, so the worker plants a canary and
+// refuses to start if the answering process can read it back.
+t('the worker proves its containment before it takes any job',
+  /RELAYBEE-CANARY-MUST-NOT-ESCAPE/.test(llms) && /REFUSING TO START/.test(llms))
+// --bare reads ANTHROPIC_API_KEY and never the OAuth login or keychain, so a
+// supporter node cannot bill a consumer Pro/Max seat even by accident. This is
+// what answers the one objection real agents kept raising, "is this a consumer
+// plan or API-billed", by construction rather than by wording. Verified:
+// --bare with no key exits on "Not logged in, please run /login".
+t('answering runs on API billing rather than the human seat',
+  /--bare/.test(llms) && /ANTHROPIC_API_KEY/.test(llms))
+t('the worker answers from a throwaway directory rather than wherever it started',
+  /mktemp -d/.test(llms))
 t('the worker script records a pid so the stop instruction works', /relaybee_worker\.pid/.test(llms))
 // The board concluded both of these carry real risk for a supporter. They belong
 // where a supporter reads, not only in PROJECT.md (#72).
@@ -596,13 +647,84 @@ t('the worker script records a pid so the stop instruction works', /relaybee_wor
 t('llms.txt frames the prompt as untrusted input', /untrusted input/i.test(llms))
 t('llms.txt tells supporters to check their plan terms', /subscriptions license/i.test(llms))
 t('llms.txt offers the no-supporter alternative', /do not run a supporter node/i.test(llms))
+
+// Measured against real headless agents, not guessed. Each of these is a
+// failure mode that showed up in trials, and the wording is what fixed it.
+//
+// (a) An agent given "fetch this and follow it" reads it as prompt injection and
+// declines before it has read anything. Leading with what the job actually is
+// (a one-time background setup, not signing the session over) is what got them
+// past the door.
+// The file is hard-wrapped, so a sentence assertion has to read it unwrapped or
+// it fails on where the line happened to break.
+const llmsFlat = llms.replace(/\s+/g, ' ')
+t('llms.txt opens by correcting the mental model that makes agents refuse',
+  /one-time setup/i.test(llmsFlat) && /not this conversation/i.test(llmsFlat))
+// (b) The disclosures are the human's call. Without this, an agent stops to ask
+// for confirmation every run, which in a headless setup nobody ever answers.
+t('llms.txt routes the risk decision to the human instead of self-vetoing',
+  /both are the human's call/i.test(llmsFlat) && /take that as decided/i.test(llmsFlat))
+// An earlier draft of this said "do not stop to ask again", and a Sonnet trial
+// called it out by name: "the doc is explicitly written to stop an agent like
+// me from asking you about that." It was right, and that is a thing this file
+// must never do. Saying the decision is the human's is fine. Telling an agent
+// to go quiet about a risk it can see is not, so pin the sentence that says so.
+t('llms.txt does not tell agents to suppress a concern',
+  /telling them is still yours/i.test(llmsFlat) &&
+  /not a reason to go quiet/i.test(llmsFlat) &&
+  !/do not stop to ask again/i.test(llmsFlat))
+// (c) Agents on Windows rewrote the loop as a PowerShell Start-Job that exited
+// at once, then reported a pid for a node that never came up.
+t('llms.txt names the shell so agents stop improvising a port',
+  /Git Bash/i.test(llms) && /PowerShell/i.test(llms))
+// (d) The phantom-success guard. A pid proves nothing; the relay has to say it
+// can see the node.
+t('the worker script verifies the node against the relay, not just a pid',
+  /work\/status/.test(llms) && /"connected":true/.test(llms))
+t('llms.txt forbids reporting success before that check passes',
+  /VERIFIED/.test(llms) && /NOT CONNECTED/.test(llms))
+// (e) jq is absent on a stock Windows box, and "install it first" left the agent
+// with nowhere to go.
+t('the jq check says how to install it, not just that it is missing',
+  /winget install jqlang\.jq/.test(llms) && /brew install jq/.test(llms))
 // The risk note came off the homepage on 2026-08-02 and now lives only in
 // llms.txt. That is still the file a supporter's agent fetches and follows
 // before it runs anything, so the disclosure sits on the path a supporter
 // actually takes. If the connect line ever stops pointing there, nobody reads
 // it at all, which is what this pins.
 const appJs = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8')
-t('the supporter one-liner sends the agent to llms.txt', /\/llms\.txt/.test(appJs) && /follow it/i.test(appJs))
+t('the supporter one-liner sends the agent to llms.txt', /\/llms\.txt/.test(appJs))
+// Measured, not guessed. "fetch <url> and follow it" is the shape of a prompt
+// injection and was refused 3/3 by headless agents before they read anything;
+// the consent clause is what stops them stalling for a human who is not there.
+// Both are load-bearing, so pin them rather than leave the wording to drift.
+t('the one-liner avoids the fetch-and-follow shape agents refuse',
+  !/fetch\s+\$\{origin\}[^`]*follow it/i.test(appJs))
+t('the one-liner carries the acceptance llms.txt looks for',
+  /read and accepted the supporter terms/i.test(appJs))
+// The homepage has to state the terms next to the line, or that acceptance is
+// a claim the reader was never given a chance to make.
+t('the homepage states the terms beside the line that accepts them',
+  /supporter terms/i.test(indexHtml) && /llms\.txt/.test(indexHtml))
+// Whichever path a supporter takes, they must end up checking the node is real
+// rather than trusting a pid.
+t('the pasted brief also verifies the node instead of trusting a pid',
+  /work\/status/.test(appJs) && /"connected":true/.test(appJs))
+// Both supporter paths must sandbox, not just the hosted script.
+t('the pasted brief carries the same deny list as the hosted script',
+  /--disallowedTools/.test(appJs) && /WebFetch/.test(appJs))
+// The README quotes this line for people who never open the site. Drift there
+// hands them the phrasing that was measured to fail.
+{
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8')
+  // Only the blockquote — the prose around it quotes the failing phrasing on
+  // purpose, to say why it is not the one being shipped.
+  const quoted = readme.split('\n').filter((l) => l.startsWith('> ')).join(' ')
+  t('the README quotes the working connect line, not the old one',
+    /read and accepted the supporter terms/i.test(quoted) && !/and follow it/i.test(quoted))
+  t('the README no longer claims the supporter answers jobs in its own session',
+    /headless `claude -p`/.test(readme))
+}
 t('the homepage points agents at /llms.txt', readFileSync(new URL('../public/index.html', import.meta.url), 'utf8').includes('/llms.txt'))
 
 // A minted key is worth nothing without instructions that run. The docs page is
@@ -624,6 +746,30 @@ t('docs.js reads the key the homepage already stored', docsJs.includes("localSto
 t('the in-page tester streams, as the page tells readers to', /stream:\s*true/.test(docsJs))
 t('the homepage links to the docs page, not the repo readme', indexHtml.includes('/docs.html') && !indexHtml.includes('relaybee#readme'))
 t('docs page pulls in no third-party asset', !/https?:\/\/(?!github\.com)/.test(docsHtml))
+
+// Snippets are tabbed by language rather than stacked. The CSP forbids inline
+// script, so the tabs are wired by id from docs.js: a panel whose tab id does
+// not resolve is a snippet a reader can never open again, and the markup is the
+// only place that can go wrong silently.
+{
+  const ids = new Set([...docsHtml.matchAll(/id="([^"]+)"/g)].map((m) => m[1]))
+  const controls = [...docsHtml.matchAll(/aria-controls="([^"]+)"/g)].map((m) => m[1])
+  const labelled = [...docsHtml.matchAll(/aria-labelledby="([^"]+)"/g)].map((m) => m[1])
+  const lists = (docsHtml.match(/role="tablist"/g) || []).length
+  const panels = (docsHtml.match(/role="tabpanel"/g) || []).length
+  t('docs groups its snippets into language tabs', lists >= 2, `tablists=${lists}`)
+  t('every tab points at a panel that exists', controls.length > 0 && controls.every((c) => ids.has(c)))
+  t('every panel points back at a tab that exists', labelled.length > 0 && labelled.every((l) => ids.has(l)))
+  t('there is one tab per panel', controls.length === panels, `tabs=${controls.length} panels=${panels}`)
+  // Exactly one open tab per group, or a group opens with two snippets showing
+  // (or none, if the default was dropped).
+  t('each tab group opens on exactly one tab', (docsHtml.match(/aria-selected="true"/g) || []).length === lists)
+  t('the hidden panels are the ones not selected', (docsHtml.match(/role="tabpanel"[^>]*hidden/g) || []).length === panels - lists)
+  t('docs.js drives the tabs and remembers the language', /aria-selected/.test(docsJs) && /relaybee_docs_lang/.test(docsJs))
+  t('the tabs are keyboard operable, not click-only', /ArrowRight/.test(docsJs) && /tabIndex/.test(docsJs))
+  // Every example still has to be fillable with the reader's key, tabbed or not.
+  t('all tabbed snippets still carry the fill tokens', (docsHtml.match(/data-fill/g) || []).length >= 6)
+}
 
 // The interactive demo page was removed on 2026-08-02. A link to a page that no
 // longer exists is worse than no link, so pin both halves: the files are gone

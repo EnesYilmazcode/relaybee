@@ -99,6 +99,25 @@ textarea {
 .snippet .copy:hover { color: var(--ink); border-color: var(--dim); }
 .snippet .copy.done { color: #15803d; border-color: #15803d; }
 
+/* --- language tabs ---
+   One snippet visible at a time instead of a stack of them. Panels are hidden
+   with [hidden], so a reader with JS off still sees the first one rather than
+   an empty section. */
+.tabs { margin: 0 0 18px; }
+.tablist { display: flex; gap: 2px; margin-bottom: 10px; border-bottom: 1px solid var(--line); }
+.tablist [role="tab"] {
+  appearance: none; cursor: pointer; background: none; border: none;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  padding: 7px 12px; font: inherit; font-size: 13px; color: var(--dim);
+}
+.tablist [role="tab"]:hover { color: var(--ink); }
+.tablist [role="tab"][aria-selected="true"] {
+  color: var(--ink); font-weight: 600; border-bottom-color: var(--ink);
+}
+.tabs [role="tabpanel"] > .snippet:last-child { margin-bottom: 0; }
+.tabs [role="tabpanel"] > p:last-child { margin-bottom: 0; }
+.tabs [role="tabpanel"] > p:first-child { margin-top: 0; }
+
 .aside { margin: 0 0 20px; }
 .aside > summary { cursor: pointer; font-size: 13px; color: var(--dim); }
 .aside > summary:hover { color: var(--ink); }
