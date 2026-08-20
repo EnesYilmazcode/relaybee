@@ -56,12 +56,18 @@ async function* frames(upstream: ReadableStream<Uint8Array>) {
     const { done, value } = await reader.read()
     if (done) break
     buf += decoder.decode(value, { stream: true })
-    let idx: number
-    while ((idx = buf.indexOf('\n\n')) !== -1) {
-      const raw = buf.slice(0, idx)
-      buf = buf.slice(idx + 2)
+    // A frame ends at a blank line, and the spec allows CRLF as well as LF.
+    // Splitting on LF-LF alone means a CRLF stream never yields a frame at all:
+    // the buffer grows for the whole response and the caller gets a successful,
+    // empty answer. No adapter here sends CRLF today, which is exactly why this
+    // would be found the hard way.
+    const sep = /\r?\n\r?\n/
+    let m: RegExpExecArray | null
+    while ((m = sep.exec(buf)) !== null) {
+      const raw = buf.slice(0, m.index)
+      buf = buf.slice(m.index + m[0].length)
       let data = ''
-      for (const line of raw.split('\n')) {
+      for (const line of raw.split(/\r?\n/)) {
         if (line.startsWith('data:')) data += line.slice(5).trim()
       }
       if (data) yield { data }

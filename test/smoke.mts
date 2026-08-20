@@ -637,5 +637,34 @@ t('no page links to the demo', ![indexHtml, docsHtml, notFoundHtml].some((s) => 
 t('the homepage footer is docs and source only', (indexHtml.match(/<footer>[\s\S]*?<\/footer>/)?.[0].match(/<a /g) || []).length === 2)
 t('the supporter toggle reads Support', />Support</.test(indexHtml))
 
+// The job trim decides a caller has given up. It has to outlast the longest
+// wait a caller can legitimately still be in, or a supporter freeing up inside
+// that band eats the job of somebody who is still holding the connection.
+console.log('%srelay lifetimes - the trim outlasts the longest caller wait', String.fromCharCode(10))
+{
+  const gatewaySrc = readFileSync(new URL('../lib/gateway.ts', import.meta.url), 'utf8')
+  const queueSrc = readFileSync(new URL('../lib/queue.ts', import.meta.url), 'utf8')
+  const num = (src: string, name: string) => Number((new RegExp(name + ' *= *([0-9_]+)').exec(src)?.[1] ?? '0').replace(/_/g, ''))
+  const streamWait = num(gatewaySrc, 'RELAY_STREAM_WAIT_MS')
+  const jobMaxAge = num(queueSrc, 'JOB_MAX_AGE_MS')
+  t('both constants were found', streamWait > 0 && jobMaxAge > 0, `stream=${streamWait} trim=${jobMaxAge}`)
+  t('a queued job outlives the longest caller wait', jobMaxAge >= streamWait, `trim ${jobMaxAge}ms vs stream wait ${streamWait}ms`)
+}
+
+// SSE frames are separated by a blank line, and the spec allows CRLF. Splitting
+// on LF-LF alone buffers a CRLF stream forever and answers with nothing.
+console.log('%ssse - a CRLF stream is parsed, not silently swallowed', String.fromCharCode(10))
+{
+  const crlf = [
+    'event: content_block_delta', 'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hel"}}', '',
+    'event: content_block_delta', 'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"lo"}}', '',
+    'event: message_stop', 'data: {"type":"message_stop"}', '',
+  ].join(String.fromCharCode(13) + String.fromCharCode(10))
+  const src = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode(crlf)); c.close() } })
+  const out = await new Response(ADAPTERS.anthropic.translateStream(src, 'anthropic/x', false)).text()
+  t('a CRLF-separated stream still yields its content', /hel/.test(out) && /lo/.test(out), JSON.stringify(out.slice(0, 120)))
+  t('and it still terminates properly', out.trimEnd().endsWith('data: [DONE]'))
+}
+
 console.log(failed === 0 ? '\nall checks passed\n' : `\n${failed} check(s) failed\n`)
 process.exit(failed === 0 ? 0 : 1)

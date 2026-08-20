@@ -26,7 +26,21 @@ const PRESENCE_TTL_S = 45
 // Hard caps so an idle or attacked queue can't grow without bound. A job is
 // ~32KB max; 200 is a generous ceiling for a demo and self-heals as work drains.
 const MAX_QUEUE = 200
-const JOB_MAX_AGE_MS = 60_000
+// Never shorter than RELAY_STREAM_WAIT_MS in lib/gateway.ts.
+//
+// This was 60s, which was right when the only caller wait was the 20s buffered
+// one. The 110s streaming window arrived later and nobody revisited the
+// constant, so for the 50 seconds between them a supporter freeing up would
+// BRPOP the job, decide its caller had given up, and throw it away while that
+// caller was still holding the connection. The caller then timed out with
+// nothing, having been one poll away from an answer.
+//
+// The comment this replaces justified the drop as clearing jobs "whose callers
+// already gave up". A caller that really gives up already removes its own job:
+// cancelJob() runs on both timeout paths in gateway.ts. This trim is only for
+// jobs whose caller vanished without telling us, so it has to outlast the
+// longest wait the caller could legitimately still be in.
+const JOB_MAX_AGE_MS = 120_000
 
 interface Store {
   push(job: Job): Promise<void>
