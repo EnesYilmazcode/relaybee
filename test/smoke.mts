@@ -435,8 +435,31 @@ t('vercel: Referrer-Policy no-referrer', headerVal(allRoutes, 'Referrer-Policy')
 t('vercel: X-Frame-Options DENY', headerVal(allRoutes, 'X-Frame-Options') === 'DENY')
 t('vercel: Permissions-Policy disables camera/mic/geo',
   headerVal(allRoutes, 'Permissions-Policy') === 'camera=(), microphone=(), geolocation=()')
-t('vercel: no CSP header (pages use per-page meta)',
-  headerVal(allRoutes, 'Content-Security-Policy') === undefined)
+// The three pages carry byte-identical CSP meta tags, which is three places for
+// one policy to drift and a policy the browser only sees after it has started
+// parsing. A response header arrives first, covers every route including the
+// ones that serve no HTML, and can express frame-ancestors, which meta cannot.
+// The metas stay as defence in depth.
+const cspHeader = headerVal(allRoutes, 'Content-Security-Policy') ?? ''
+t('vercel: a CSP ships as a response header', cspHeader.length > 0)
+t('vercel: the header CSP denies by default', /default-src 'none'/.test(cspHeader))
+t('vercel: the header CSP forbids framing, which meta cannot',
+  /frame-ancestors 'none'/.test(cspHeader))
+{
+  // Every page meta must be a subset of the header, or the browser enforces the
+  // intersection and one of the two is quietly doing nothing.
+  const metaOf = (html: string) => html.match(/http-equiv="Content-Security-Policy"[\s\S]*?content="([^"]+)"/)?.[1] ?? ''
+  const directives = (csp: string) => new Set(csp.split(';').map((d) => d.trim()).filter(Boolean))
+  const headerDirectives = directives(cspHeader)
+  const read = (f: string) => readFileSync(new URL(`../public/${f}`, import.meta.url), 'utf8')
+  for (const [name, html] of [['index', read('index.html')], ['docs', read('docs.html')], ['404', read('404.html')]] as Array<[string, string]>) {
+    const meta = metaOf(html)
+    t(`csp: ${name}.html still carries a meta policy`, meta.length > 0)
+    t(`csp: ${name}.html does not contradict the header`,
+      [...directives(meta)].every((d) => headerDirectives.has(d)),
+      [...directives(meta)].filter((d) => !headerDirectives.has(d)).join('; '))
+  }
+}
 const assetRule = (vercelCfg.headers ?? []).find((h: any) =>
   /app\.css/.test(h.source) && /app\.js/.test(h.source) && /favicon\.svg/.test(h.source))
 t('vercel: static asset cache rule exists', !!assetRule)
