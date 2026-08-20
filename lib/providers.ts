@@ -213,7 +213,12 @@ export const ADAPTERS: Record<string, Adapter> = { anthropic, openai, groq }
 export function route(modelString: string): { adapter: Adapter; model: string } | null {
   const i = modelString.indexOf('/')
   if (i === -1) return null
-  const adapter = ADAPTERS[modelString.slice(0, i)]
+  // hasOwn, not a truthy index. ADAPTERS is a plain object, so "constructor/x"
+  // and "__proto__/x" resolved to something truthy off Object.prototype with no
+  // id and no endpoint, and the caller got a confusing 403 about a connection
+  // for provider "undefined" instead of a clean "unknown model" 400.
+  const name = modelString.slice(0, i)
+  const adapter = Object.hasOwn(ADAPTERS, name) ? ADAPTERS[name] : undefined
   const model = modelString.slice(i + 1)
   if (!adapter || !model) return null
   return { adapter, model }

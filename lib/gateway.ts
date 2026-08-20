@@ -105,6 +105,12 @@ const MAX_JOB_BYTES = 32 * 1024
 // oversized payload is both an amplification vector and a way to burn function
 // time on JSON.parse. 256KB is far past any legitimate chat request (the relay
 // caps its own message payload at 32KB) and rejects the rest cleanly.
+//
+// Counted in bytes, which is what the name says and what the cost is. This was
+// measured on a JS string's .length, and that counts UTF-16 code units: every
+// CJK character is one unit and three bytes, so the real ceiling was 768KB, and
+// past the pool walk that is eight outbound copies of it. api/work/complete.ts
+// already did this correctly with a TextEncoder; these two did not.
 export const MAX_BODY_BYTES = 256 * 1024
 
 /** OpenAI content can be a string or an array of typed parts; jobs carry plain text. */
@@ -127,7 +133,7 @@ async function relayCompletion(body: ChatRequest, headers: Record<string, string
     return err(400, 'No text content to relay. The claude-code model needs at least one message with text.', 'invalid_request_error', headers)
   }
   const payload = JSON.stringify(messages)
-  if (payload.length > MAX_JOB_BYTES) {
+  if (new TextEncoder().encode(payload).length > MAX_JOB_BYTES) {
     return err(400, `Request too large for the relay: cap is ${MAX_JOB_BYTES / 1024}KB of messages.`, 'invalid_request_error', headers)
   }
 
@@ -265,15 +271,18 @@ async function chatCompletionsInner(req: Request): Promise<Response> {
   // Read the body once as text so we can bound its size before parsing or
   // touching any upstream. An oversized payload is rejected here — before the
   // relay submit or any provider fetch — so it can never be amplified outward.
-  let rawBody: string
+  // arrayBuffer, not text: byteLength is the real size, and measuring it before
+  // decoding also avoids materialising the string for a body we are rejecting.
+  let rawBytes: ArrayBuffer
   try {
-    rawBody = await req.text()
+    rawBytes = await req.arrayBuffer()
   } catch {
     return err(400, 'Could not read the request body.', 'invalid_request_error', headers)
   }
-  if (rawBody.length > MAX_BODY_BYTES) {
+  if (rawBytes.byteLength > MAX_BODY_BYTES) {
     return err(400, `Request body too large: cap is ${MAX_BODY_BYTES / 1024}KB.`, 'invalid_request_error', headers)
   }
+  const rawBody = new TextDecoder().decode(rawBytes)
 
   let body: ChatRequest
   try {

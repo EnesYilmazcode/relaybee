@@ -637,5 +637,47 @@ t('no page links to the demo', ![indexHtml, docsHtml, notFoundHtml].some((s) => 
 t('the homepage footer is docs and source only', (indexHtml.match(/<footer>[\s\S]*?<\/footer>/)?.[0].match(/<a /g) || []).length === 2)
 t('the supporter toggle reads Support', />Support</.test(indexHtml))
 
+// Three limits that did not measure what their names claimed.
+console.log('%slimits - the caps count what they say they count', String.fromCharCode(10))
+{
+  const connect = (await import('../api/connect.ts')).default
+  const limitKey = await issueKey('limits_probe')
+  const post = (body: unknown, path = '/api/connect') => new Request('https://x' + path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${limitKey}` },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  })
+
+  // "constructor" is not a provider, but a plain object answers for it.
+  const proto = await connect(post({ provider: 'constructor', api_key: 'sk-test-12345678' }))
+  t('a prototype key is not accepted as a provider', proto.status === 400, `status=${proto.status}`)
+  t('and neither is __proto__', (await connect(post({ provider: '__proto__', api_key: 'sk-test-12345678' }))).status === 400)
+  t('route() does not resolve a prototype key either', route('constructor/x') === null && route('__proto__/x') === null)
+
+  // /api/connect had no body cap at all, and sealing is AES-GCM over whatever arrived.
+  const huge = await connect(post({ provider: 'anthropic', api_key: 'sk-' + 'x'.repeat(20 * 1024) }))
+  t('an oversized connect body is refused', huge.status === 400, `status=${huge.status}`)
+
+  // ...and no meter, the only authenticated route without one.
+  let sawLimit = false
+  for (let i = 0; i < 40 && !sawLimit; i++) {
+    const r = await connect(post({ provider: 'anthropic', api_key: 'sk-test-12345678' }))
+    if (r.status === 429) sawLimit = true
+  }
+  t('connect is metered per source', sawLimit)
+
+  // The proxy body cap counted UTF-16 code units. Every CJK character is one
+  // unit and three bytes, so a body inside the old cap was three times the size.
+  const cjk = { model: 'claude-code', messages: [{ role: 'user', content: '漢'.repeat(120 * 1024) }] }
+  const cjkBody = JSON.stringify(cjk)
+  t('the probe body is under the cap by string length', cjkBody.length < MAX_BODY_BYTES, `${cjkBody.length} chars`)
+  t('but over it in real bytes', new TextEncoder().encode(cjkBody).length > MAX_BODY_BYTES,
+    `${new TextEncoder().encode(cjkBody).length} bytes`)
+  const cjkRes = await chatCompletions(new Request('https://x/api/v1/chat/completions', {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${limitKey}` }, body: cjkBody,
+  }))
+  t('and it is refused on bytes, not characters', cjkRes.status === 400, `status=${cjkRes.status}`)
+}
+
 console.log(failed === 0 ? '\nall checks passed\n' : `\n${failed} check(s) failed\n`)
 process.exit(failed === 0 ? 0 : 1)
