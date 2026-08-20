@@ -637,5 +637,26 @@ t('no page links to the demo', ![indexHtml, docsHtml, notFoundHtml].some((s) => 
 t('the homepage footer is docs and source only', (indexHtml.match(/<footer>[\s\S]*?<\/footer>/)?.[0].match(/<a /g) || []).length === 2)
 t('the supporter toggle reads Support', />Support</.test(indexHtml))
 
+// GET /api/v1/models feeds model pickers, so every id it hands out has to be one
+// the router will actually accept. It used to list provider names, which are the
+// one thing routing rejects: "anthropic" alone is a 400, "anthropic/<model>" is not.
+console.log('\nmodels - every advertised id is one the router accepts')
+{
+  const listKey = await issueKey('models_probe')
+  const res = await (await import('../api/v1/models.ts')).default(
+    new Request('https://relaybee.test/api/v1/models', { headers: { authorization: `Bearer ${listKey}` } }),
+  )
+  const body = (await res.json()) as { data: Array<{ id: string; object: string }>; providers: Array<{ id: string }> }
+  t('the list is not empty', body.data.length > 0, `${body.data.length}`)
+  t('every entry is typed as a model', body.data.every((m) => m.object === 'model'))
+  t(
+    'every advertised id routes or is the relay model',
+    body.data.every((m) => m.id === 'claude-code' || Boolean(route(m.id))),
+    body.data.map((m) => m.id).join(', '),
+  )
+  t('a bare provider name is NOT advertised as a model', !body.data.some((m) => m.id in ADAPTERS))
+  t('the providers are still reported, separately', body.providers.length === Object.keys(ADAPTERS).length)
+}
+
 console.log(failed === 0 ? '\nall checks passed\n' : `\n${failed} check(s) failed\n`)
 process.exit(failed === 0 ? 0 : 1)

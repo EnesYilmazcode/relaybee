@@ -65,6 +65,19 @@ function shouldFailover(status: number) {
 // Eight is well past any legitimate pool and bounds the blast radius.
 export const MAX_POOL = 8
 
+/**
+ * The OpenAI models list.
+ *
+ * Every id in `data` has to be something a caller can put in `model` and have
+ * work, because that is the entire contract of this endpoint and clients build
+ * model pickers straight out of it. This used to return the provider names with
+ * `object: "provider"`, which meant a picker offered "anthropic" and every pick
+ * came back 400: routing wants "<provider>/<model>", not a bare provider.
+ *
+ * There is exactly one model Relaybee serves on its own, so `data` has one
+ * entry. The providers are still worth reporting, they are just not models, so
+ * they moved to their own field with the shape a caller has to build.
+ */
 export async function listModels(req: Request): Promise<Response> {
   if (req.method === 'OPTIONS') return preflight()
   const g = await gate(req)
@@ -72,7 +85,8 @@ export async function listModels(req: Request): Promise<Response> {
   return new Response(
     JSON.stringify({
       object: 'list',
-      data: [...Object.keys(ADAPTERS), RELAY_PROVIDER].map((id) => ({ id, object: 'provider' })),
+      data: [{ id: RELAY_PROVIDER, object: 'model', owned_by: 'relaybee' }],
+      providers: Object.keys(ADAPTERS).map((id) => ({ id, model_format: `${id}/<model>` })),
     }),
     { headers: { 'content-type': 'application/json', ...CORS, ...g.headers } },
   )
