@@ -190,7 +190,13 @@ async function main() {
   ok('both server secrets are configured',
     health.body?.configured?.master_secret === true && health.body?.configured?.master_encryption_key === true,
     JSON.stringify(health.body?.configured))
-  ok('a durable queue backend is wired', health.body?.queue === 'upstash', 'queue=' + health.body?.queue)
+  // Against production the queue must be the durable one. Against a local
+  // harness or a preview it is whatever that deployment was given, and asserting
+  // upstash there would fail for the wrong reason.
+  const isProd = BASE === 'https://relaybee.vercel.app'
+  ok(isProd ? 'a durable queue backend is wired' : 'the queue backend is reported',
+    isProd ? health.body?.queue === 'upstash' : typeof health.body?.queue === 'string',
+    'queue=' + health.body?.queue)
   summary.commit = health.body?.commit
   summary.queue = health.body?.queue
   console.log(dim('  serving commit ' + health.body?.commit + ', providers ' + (health.body?.providers ?? []).join(', ')))
