@@ -2,14 +2,15 @@
   "name": "relaybee",
   "version": "0.1.0",
   "private": true,
-  "description": "Personal AI capacity router — one endpoint, all your keys, automatic failover.",
+  "description": "Personal AI capacity router \u2014 one endpoint, all your keys, automatic failover.",
   "scripts": {
     "secrets": "node scripts/gen-secrets.mjs",
     "typecheck": "tsc --noEmit",
     "test": "tsx test/smoke.mts",
     "test:upstash": "tsx test/upstash.mts",
     "test:e2e": "tsx test/e2e.mts",
-    "check": "npm run typecheck && npm test && npm run test:upstash"
+    "check": "npm run typecheck && npm test && npm run test:upstash",
+    "test:live": "tsx test/live-e2e.mts"
   },
   "devDependencies": {
     "typescript": "^5.6.3",
