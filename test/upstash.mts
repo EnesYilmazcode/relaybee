@@ -163,6 +163,33 @@ t('health still answers 200 while the queue is down', h2.status === 200, `status
 t('health reports the unreadable count as null instead of throwing', h2Body.supporters_online === null, String(h2Body.supporters_online))
 t('health still reports the rest of the service', h2Body.ok === true && h2Body.queue === 'upstash')
 
+// docs.js and app.js both explain the status poll interval by naming what a
+// poll costs. That number is load-bearing (it is the argument for a 10s poll
+// against a 500K monthly budget) and it went stale silently when the count
+// dropped from three to two. Measure it, and hold the docs to the measurement.
+console.log('%supstash - the documented poll cost is the real poll cost', String.fromCharCode(10))
+{
+  const { readFileSync } = await import('node:fs')
+  const statusKey = await issueKey('poll_cost_probe')
+  const status = (await import('../api/work/status.ts')).default
+  // Earlier blocks arm fake.failNext to exercise the outage guards; clear it so
+  // a leftover queued failure does not answer for this one.
+  fake.failNext(0)
+  fake.reset()
+  const res = await status(new Request('https://x/api/work/status', { headers: { authorization: `Bearer ${statusKey}` } }))
+  const cost = fake.total()
+  t('a status poll answers', res.status === 200, `status=${res.status}`)
+  t('and it costs a small, known number of commands', cost > 0 && cost <= 4,
+    `${cost} commands: ${[...fake.counts].map(([k, v]) => k + '=' + v).join(' ')}`)
+  const words: Record<number, string> = { 1: 'one', 2: 'two', 3: 'three', 4: 'four' }
+  for (const f of ['docs.js', 'app.js']) {
+    const src = readFileSync(new URL(`../public/${f}`, import.meta.url), 'utf8')
+    const claim = /each poll is (one|two|three|four) Upstash commands/i.exec(src)
+    if (!claim) continue
+    t(`public/${f} states the measured cost`, claim[1] === words[cost], `says ${claim[1]}, measured ${words[cost]}`)
+  }
+}
+
 await fake.close()
 console.log(failed === 0 ? '\nupstash: all checks passed' : `\nupstash: ${failed} check(s) FAILED`)
 process.exit(failed === 0 ? 0 : 1)

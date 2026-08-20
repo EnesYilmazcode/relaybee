@@ -3,8 +3,14 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["node"],
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "types": [
+      "node"
+    ],
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
@@ -13,5 +19,9 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["api/**/*.ts", "lib/**/*.ts"]
+  "include": [
+    "api/**/*.ts",
+    "lib/**/*.ts",
+    "test/**/*.mts"
+  ]
 }
