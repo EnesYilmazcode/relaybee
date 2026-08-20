@@ -34,6 +34,74 @@ function fill() {
     : 'Mint one and every example below fills itself in. Keys are free, unauthenticated, and last 90 days.'
 }
 
+// --- language tabs ---------------------------------------------------------
+
+// One snippet visible per group instead of a stack. The choice is shared across
+// groups and remembered, so a PowerShell reader who picks it once in section 1
+// gets it again in section 4 and on their next visit. Groups do not all offer
+// the same languages, so a group without the remembered one keeps its first tab.
+const LANG_KEY = 'relaybee_docs_lang'
+
+const lists = [...document.querySelectorAll('.tablist')]
+const tabsIn = (list) => [...list.querySelectorAll('[role="tab"]')]
+const labelOf = (tab) => tab.textContent.trim()
+
+/** Select one tab within its own group. No persistence, no cross-group effect. */
+function showTab(tab, focus = false) {
+  for (const other of tabsIn(tab.parentElement)) {
+    const on = other === tab
+    other.setAttribute('aria-selected', String(on))
+    // Roving tabindex: one stop for the whole group, arrows move within it.
+    other.tabIndex = on ? 0 : -1
+    document.getElementById(other.getAttribute('aria-controls')).hidden = !on
+  }
+  if (focus) tab.focus()
+}
+
+/** Switch every group that offers this language, and remember the choice.
+ *  A reader who picks PowerShell in section 1 means it for section 4 as well,
+ *  and a group that does not offer it keeps whatever it was showing. */
+function chooseLang(label, focus = null) {
+  for (const list of lists) {
+    const match = tabsIn(list).find((t) => labelOf(t) === label)
+    if (match) showTab(match, focus === list)
+  }
+  try { localStorage.setItem(LANG_KEY, label) } catch { /* private mode */ }
+}
+
+for (const list of lists) {
+  list.addEventListener('click', (e) => {
+    const tab = e.target.closest('[role="tab"]')
+    if (tab) chooseLang(labelOf(tab))
+  })
+
+  list.addEventListener('keydown', (e) => {
+    const tabs = tabsIn(list)
+    const i = tabs.indexOf(document.activeElement)
+    if (i === -1) return
+    const to = e.key === 'ArrowRight' ? i + 1
+      : e.key === 'ArrowLeft' ? i - 1
+      : e.key === 'Home' ? 0
+      : e.key === 'End' ? tabs.length - 1
+      : -1
+    if (to === -1) return
+    e.preventDefault()
+    chooseLang(labelOf(tabs[(to + tabs.length) % tabs.length]), list)
+  })
+}
+
+// Restore the remembered language. Do it per group rather than through
+// chooseLang so a group that does not offer it is left on its own first tab
+// instead of the preference being rewritten by whatever loaded last.
+let preferred = ''
+try { preferred = localStorage.getItem(LANG_KEY) || '' } catch { /* private mode */ }
+if (preferred) {
+  for (const list of lists) {
+    const match = tabsIn(list).find((t) => labelOf(t) === preferred)
+    if (match) showTab(match)
+  }
+}
+
 // --- clipboard -------------------------------------------------------------
 
 async function copy(btn, text) {
