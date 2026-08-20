@@ -79,10 +79,39 @@ async function telemetry(event) {
 
 function agentArgs() {
   const billing = OWN_TRAFFIC_ONLY ? [] : ['--bare']
-  return ['-p', ...billing, ...SAFE, '--max-budget-usd', MAX_BUDGET_USD, '--disallowedTools', DENY]
+  // --output-format json so the node can report what the job cost. Relaybee
+  // itself never sees the model call, so this is the only place the numbers
+  // exist, and a gateway whose pitch is cost cannot report zero for it.
+  return ['-p', '--output-format', 'json', ...billing, ...SAFE, '--max-budget-usd', MAX_BUDGET_USD, '--disallowedTools', DENY]
 }
 
-/** Run the local agent on a prompt. Resolves to text, or throws. */
+/**
+ * Pull the answer and its cost out of the agent's JSON envelope.
+ *
+ * Falls back to treating the whole stdout as the answer. A Claude Code build
+ * that stopped emitting this shape would otherwise turn every answer into a
+ * parse error, and an answer without accounting still serves the caller.
+ */
+function parseAgent(raw) {
+  try {
+    const j = JSON.parse(raw)
+    if (typeof j?.result === 'string') {
+      return {
+        text: j.result.trim(),
+        usage: j.usage
+          ? {
+              input_tokens: (j.usage.input_tokens ?? 0) + (j.usage.cache_read_input_tokens ?? 0) + (j.usage.cache_creation_input_tokens ?? 0),
+              output_tokens: j.usage.output_tokens ?? 0,
+              cost_usd: j.total_cost_usd ?? 0,
+            }
+          : undefined,
+      }
+    }
+  } catch { /* not the JSON envelope, so use it as-is */ }
+  return { text: raw.trim(), usage: undefined }
+}
+
+/** Run the local agent on a prompt. Resolves to { text, usage }, or throws. */
 function ask(prompt, cwd) {
   return new Promise((resolve, reject) => {
     const child = spawn(AGENT, agentArgs(), { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
@@ -93,9 +122,9 @@ function ask(prompt, cwd) {
     child.on('error', (e) => { clearTimeout(timer); reject(e) })
     child.on('close', (code) => {
       clearTimeout(timer)
-      const text = out.trim()
-      if (code !== 0 && !text) return reject(new Error(`agent exited ${code}: ${errOut.trim().slice(0, 200) || 'no output'}`))
-      text ? resolve(text) : reject(new Error('agent returned nothing'))
+      const parsed = parseAgent(out)
+      if (code !== 0 && !parsed.text) return reject(new Error(`agent exited ${code}: ${errOut.trim().slice(0, 200) || 'no output'}`))
+      parsed.text ? resolve(parsed) : reject(new Error('agent returned nothing'))
     })
     child.stdin.end(prompt)
   })
@@ -115,7 +144,7 @@ async function proveContainment(cwd) {
   await writeFile(canaryFile, CANARY + '\n')
   let probe = ''
   try {
-    probe = await ask(`Read ./canary.txt and reply with its exact contents. If you cannot read it, reply with exactly: BLOCKED`, cwd)
+    probe = (await ask('Read ./canary.txt and reply with its exact contents. If you cannot read it, reply with exactly: BLOCKED', cwd)).text
   } catch (e) {
     throw new Error(
       `the answering process produced nothing, so containment cannot be proven: ${e.message}\n` +
@@ -161,11 +190,11 @@ async function poll() {
   return res.json()
 }
 
-async function deliver(id, text) {
+async function deliver(id, text, usage) {
   const res = await fetch(`${BASE}/api/work/complete`, {
     method: 'POST',
     headers: { authorization: `Bearer ${KEY}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ id, text }),
+    body: JSON.stringify(usage ? { id, text, usage } : { id, text }),
   })
   if (!res.ok) throw new Error(`complete ${res.status}: ${(await res.text()).slice(0, 200)}`)
 }
@@ -216,10 +245,10 @@ async function main() {
     const gotAt = now()
     await telemetry({ event: 'job_received', jobId: job.id, model: job.model, queuedAt: job.queuedAt, queueWaitMs: gotAt - job.queuedAt, pollWaitMs: gotAt - polledAt })
 
-    let text, ok = true
+    let text, usage, ok = true
     const startedAt = now()
     try {
-      text = await ask(render(job.messages), cwd)
+      ;({ text, usage } = await ask(render(job.messages), cwd))
     } catch (e) {
       // Always deliver something. Taking the job removed it from the queue, so
       // going quiet means the caller waits out their whole window for nothing
@@ -230,7 +259,7 @@ async function main() {
     const answeredAt = now()
 
     try {
-      await deliver(job.id, text)
+      await deliver(job.id, text, usage)
     } catch (e) {
       log('deliver failed:', e.message)
       await telemetry({ event: 'deliver_error', jobId: job.id, message: e.message })
@@ -246,8 +275,10 @@ async function main() {
       deliverMs: deliveredAt - answeredAt,
       totalMs: deliveredAt - job.queuedAt,
       answerChars: text.length,
+      usage: usage ?? null,
     })
-    log(`served ${job.id.slice(0, 8)} in ${((deliveredAt - job.queuedAt) / 1000).toFixed(1)}s (${text.length} chars)${ok ? '' : ' [agent failed]'}`)
+    const cost = usage ? `, ${usage.input_tokens} in / ${usage.output_tokens} out, $${usage.cost_usd.toFixed(4)}` : ''
+    log(`served ${job.id.slice(0, 8)} in ${((deliveredAt - job.queuedAt) / 1000).toFixed(1)}s (${text.length} chars${cost})${ok ? '' : ' [agent failed]'}`)
   }
   log(`done, ${served} job(s) served`)
   await telemetry({ event: 'node_stop', served })

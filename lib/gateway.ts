@@ -9,7 +9,7 @@ import { verifyKey, bearer } from './auth'
 import { open, type Connection } from './seal'
 import { route, ADAPTERS, type ChatRequest } from './providers'
 import { check, LIMITS, clientIp, IP_PROXY_LIMIT, rlHeaders } from './ratelimit'
-import { submitJob, awaitResult, cancelJob, countLive, type Job } from './queue'
+import { submitJob, awaitResult, cancelJob, countLive, type Job, type Usage } from './queue'
 import { hasSecrets, NOT_CONFIGURED } from './config'
 
 const CORS = {
@@ -107,6 +107,27 @@ const MAX_JOB_BYTES = 32 * 1024
 // caps its own message payload at 32KB) and rejects the rest cleanly.
 export const MAX_BODY_BYTES = 256 * 1024
 
+/**
+ * A supporter's reported cost, in the shape OpenAI clients read.
+ *
+ * Zeros when a node reported nothing. That is the honest answer rather than a
+ * guess: the relay never sees the model call, so there is nothing here to
+ * estimate from, and a character-count approximation dressed as a token count
+ * is worse than a zero in a product whose whole point is cost.
+ *
+ * cost_usd is Relaybee's own field, because OpenAI has no place for a number
+ * the upstream actually knows. A client that ignores it loses nothing.
+ */
+function openaiUsage(u: Usage | undefined) {
+  if (!u) return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+  return {
+    prompt_tokens: u.inputTokens,
+    completion_tokens: u.outputTokens,
+    total_tokens: u.inputTokens + u.outputTokens,
+    cost_usd: u.costUsd,
+  }
+}
+
 /** OpenAI content can be a string or an array of typed parts; jobs carry plain text. */
 function flatten(content: unknown): string {
   if (typeof content === 'string') return content
@@ -145,13 +166,13 @@ async function relayCompletion(body: ChatRequest, headers: Record<string, string
 
   if (body.stream) return relayStream(job, body, created, relayHeaders)
 
-  let text: string | null
+  let result: Awaited<ReturnType<typeof awaitResult>>
   try {
-    text = await awaitResult(job.id, RELAY_WAIT_MS)
+    result = await awaitResult(job.id, RELAY_WAIT_MS)
   } catch {
     return err(502, 'The relay queue is temporarily unavailable. Try again shortly.', 'api_error', headers)
   }
-  if (text === null) {
+  if (result === null) {
     // Nobody is waiting for this any more. Leaving it queued means the next
     // supporter to connect spends real model time on an answer no one reads.
     await cancelJob(job).catch(() => {})
@@ -161,8 +182,8 @@ async function relayCompletion(body: ChatRequest, headers: Record<string, string
   return new Response(
     JSON.stringify({
       id: `chatcmpl-${job.id}`, object: 'chat.completion', created, model: body.model,
-      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      choices: [{ index: 0, message: { role: 'assistant', content: result.text }, finish_reason: 'stop' }],
+      usage: openaiUsage(result.usage),
     }),
     { headers: { 'content-type': 'application/json', ...CORS, ...relayHeaders } },
   )
@@ -191,6 +212,7 @@ async function timedOutMessage(known?: boolean): Promise<string> {
  * decides the connection is idle.
  */
 function relayStream(job: Job, body: ChatRequest, created: number, relayHeaders: Record<string, string>): Response {
+  const includeUsage = (body.stream_options as { include_usage?: unknown } | undefined)?.include_usage === true
   const encoder = new TextEncoder()
   const frame = (o: unknown) => `data: ${JSON.stringify(o)}\n\n`
   const chunk = (delta: unknown, finish: string | null) => ({
@@ -204,18 +226,18 @@ function relayStream(job: Job, body: ChatRequest, created: number, relayHeaders:
       send(frame(chunk({ role: 'assistant' }, null)))
 
       const deadline = Date.now() + RELAY_STREAM_WAIT_MS
-      let text: string | null = null
+      let result: Awaited<ReturnType<typeof awaitResult>> = null
       let online: boolean | undefined
       let checked = false
 
       while (Date.now() < deadline) {
         const slice = Math.min(RELAY_SLICE_MS, deadline - Date.now())
         try {
-          text = await awaitResult(job.id, slice)
+          result = await awaitResult(job.id, slice)
         } catch {
           break
         }
-        if (text !== null) break
+        if (result !== null) break
         // One presence check, after the first empty slice. If nothing is polling
         // the queue then no answer is coming, and holding the caller for the
         // full window would be a worse experience than the old 20s cap.
@@ -227,12 +249,21 @@ function relayStream(job: Job, body: ChatRequest, created: number, relayHeaders:
         send(': waiting for a supporter\n\n')
       }
 
-      if (text === null) {
+      if (result === null) {
         await cancelJob(job).catch(() => {})
         send(frame({ error: { message: await timedOutMessage(online), type: 'api_error' } }))
       } else {
-        send(frame(chunk({ content: text }, null)))
+        send(frame(chunk({ content: result.text }, null)))
         send(frame(chunk({}, 'stop')))
+        // OpenAI convention, and the same one the provider path already follows:
+        // a trailing usage chunk only when the caller opted in. Its choices array
+        // is empty, which is what tells a client the chunk is accounting.
+        if (includeUsage) {
+          send(frame({
+            id: `chatcmpl-${job.id}`, object: 'chat.completion.chunk', created, model: body.model,
+            choices: [], usage: openaiUsage(result.usage),
+          }))
+        }
       }
       send('data: [DONE]\n\n')
       controller.close()

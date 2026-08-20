@@ -13,6 +13,21 @@ export type Job = {
   queuedAt: number
 }
 
+/**
+ * What a job cost the supporter who answered it.
+ *
+ * Reported by the node, because that is the only place the numbers exist: the
+ * relay never sees the model call. So it is the node's own accounting and not
+ * something this side can verify. Absent when a node does not report it.
+ */
+export type Usage = {
+  inputTokens: number
+  outputTokens: number
+  costUsd: number
+}
+
+export type Result = { text: string; usage?: Usage }
+
 const RESULT_TTL_S = 120
 const QUEUE_KEY = 'relaybee:jobs'
 const NODES_KEY = 'relaybee:nodes'
@@ -34,9 +49,9 @@ interface Store {
   remove(job: Job): Promise<void>
   /** Block until a job is available or maxWaitMs elapses. */
   waitPop(maxWaitMs: number): Promise<Job | null>
-  setResult(id: string, text: string): Promise<void>
+  setResult(id: string, result: Result): Promise<void>
   /** Block until this job's answer arrives or maxWaitMs elapses. */
-  waitResult(id: string, maxWaitMs: number): Promise<string | null>
+  waitResult(id: string, maxWaitMs: number): Promise<Result | null>
   markPresence(userId: string): Promise<void>
   isPresent(userId: string): Promise<boolean>
   countPresent(): Promise<number>
@@ -88,8 +103,8 @@ function upstashStore(url: string, token: string): Store {
     },
     // The answer is a one-element list rather than a plain string so the waiting
     // caller can BRPOP it instead of polling GET twice a second.
-    setResult: async (id, text) => {
-      await cmd(['LPUSH', `relaybee:result:${id}`, text])
+    setResult: async (id, result) => {
+      await cmd(['LPUSH', `relaybee:result:${id}`, JSON.stringify(result)])
       await cmd(['EXPIRE', `relaybee:result:${id}`, RESULT_TTL_S])
     },
     // Same trick as waitPop, on the other side of the relay: one blocking command
@@ -103,7 +118,7 @@ function upstashStore(url: string, token: string): Store {
         if (remaining <= 0) return null
         const timeoutS = Math.max(1, Math.min(15, Math.ceil(remaining / 1000)))
         const res = (await cmd(['BRPOP', key, timeoutS])) as [string, string] | null
-        if (res && res[1]) return res[1]
+        if (res && res[1]) return decodeResult(res[1])
       }
     },
     // One command per poll, and a sweep only on the poll that grows the set.
@@ -136,7 +151,7 @@ function upstashStore(url: string, token: string): Store {
 
 function memoryStore(): Store {
   const jobs: Job[] = []
-  const results = new Map<string, { text: string; at: number }>()
+  const results = new Map<string, { result: Result; at: number }>()
   const presence = new Map<string, number>()
 
   const trimJobs = () => {
@@ -161,13 +176,13 @@ function memoryStore(): Store {
         await sleep(500)
       }
     },
-    setResult: async (id, text) => {
+    setResult: async (id, result) => {
       const now = Date.now()
       // Opportunistic sweep so read-once and orphaned answers don't accumulate.
       if (results.size > 500) {
         for (const [k, v] of results) if (now - v.at > RESULT_TTL_S * 1000) results.delete(k)
       }
-      results.set(id, { text, at: now })
+      results.set(id, { result, at: now })
     },
     // In-process, so polling costs nothing. Reads once, matching BRPOP.
     waitResult: async (id, maxWaitMs) => {
@@ -176,7 +191,7 @@ function memoryStore(): Store {
         const r = results.get(id)
         if (r) {
           results.delete(id)
-          if (Date.now() - r.at <= RESULT_TTL_S * 1000) return r.text
+          if (Date.now() - r.at <= RESULT_TTL_S * 1000) return r.result
         }
         if (Date.now() >= deadline) return null
         await sleep(100)
@@ -249,11 +264,29 @@ export async function countLive(): Promise<number> {
  * The job id is the capability: it is an unguessable UUID handed only to the
  * supporter who popped the job, so holding it is proof of assignment.
  */
-export async function completeJob(id: string, text: string): Promise<void> {
-  await store.setResult(id, text)
+export async function completeJob(id: string, text: string, usage?: Usage): Promise<void> {
+  await store.setResult(id, usage ? { text, usage } : { text })
 }
 
 /** Wait for a supporter's answer on behalf of the requesting user. */
-export async function awaitResult(id: string, maxWaitMs: number): Promise<string | null> {
+export async function awaitResult(id: string, maxWaitMs: number): Promise<Result | null> {
   return store.waitResult(id, maxWaitMs)
+}
+
+/**
+ * Read a stored answer back.
+ *
+ * Answers live for RESULT_TTL_S, so a deploy that changes this format leaves a
+ * two-minute window where the queue still holds values the previous one wrote,
+ * and those are bare answer strings. Reading one as text costs nothing; losing
+ * it to a parse error costs a caller their whole wait.
+ */
+function decodeResult(raw: string): Result {
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (parsed && typeof parsed === 'object' && typeof (parsed as Result).text === 'string') {
+      return parsed as Result
+    }
+  } catch { /* not JSON, so it is a pre-envelope answer */ }
+  return { text: raw }
 }

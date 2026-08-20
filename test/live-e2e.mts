@@ -85,9 +85,12 @@ async function mint(handle?: string): Promise<{ key: string; user_id: string }> 
   return { key: body.key, user_id: body.user_id! }
 }
 
+type Usage = { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; cost_usd?: number }
+
 type Completion = {
   status: number
   text: string
+  usage?: Usage
   headers: Headers
   firstByteMs: number | null
   totalMs: number
@@ -103,8 +106,13 @@ async function complete(key: string, body: Record<string, unknown>): Promise<Com
   if (!body.stream || !res.body) {
     const raw = await res.text()
     let text = ''
-    try { text = JSON.parse(raw)?.choices?.[0]?.message?.content ?? '' } catch { /* leave empty */ }
-    return { status: res.status, text: text || raw, headers: res.headers, firstByteMs: null, totalMs: Date.now() - t0 }
+    let usage: Usage | undefined
+    try {
+      const parsed = JSON.parse(raw)
+      text = parsed?.choices?.[0]?.message?.content ?? ''
+      usage = parsed?.usage
+    } catch { /* leave empty */ }
+    return { status: res.status, text: text || raw, usage, headers: res.headers, firstByteMs: null, totalMs: Date.now() - t0 }
   }
 
   // Streaming: time to the FIRST frame is the number that matters, because that
@@ -346,7 +354,7 @@ async function main() {
 
   type Result = {
     i: number; q: string; stream: boolean; status: number
-    totalMs: number; firstByteMs: number | null; answer: string; correct: boolean
+    totalMs: number; firstByteMs: number | null; answer: string; correct: boolean; usage?: Usage
   }
   const results: Result[] = []
   // A key per caller, so this is a real multi-tenant run rather than one client in
@@ -366,7 +374,7 @@ async function main() {
       const key = callerKeys[lane % callerKeys.length]
       const r = await complete(key, { model: 'claude-code', stream, messages: [{ role: 'user', content: q }] })
       const correct = expect.test(r.text)
-      results.push({ i, q, stream, status: r.status, totalMs: r.totalMs, firstByteMs: r.firstByteMs, answer: r.text.slice(0, 120), correct })
+      results.push({ i, q, stream, status: r.status, totalMs: r.totalMs, firstByteMs: r.firstByteMs, answer: r.text.slice(0, 120), correct, usage: r.usage })
       await event({ event: 'caller_result', i, stream, status: r.status, totalMs: r.totalMs, firstByteMs: r.firstByteMs, correct, answerChars: r.text.length })
       const tag = correct ? green('correct') : red('wrong  ')
       console.log('  ' + tag + ' ' + dim('#' + String(i).padStart(2) + ' ' + (stream ? 'stream' : 'buffer') + ' ' + String(r.totalMs).padStart(6) + 'ms') + ' ' + JSON.stringify(r.text.slice(0, 60)))
@@ -383,6 +391,15 @@ async function main() {
     'max ' + Math.max(...streamed.map((r) => r.firstByteMs ?? 0)) + 'ms')
   ok('buffered answers land too, or time out honestly', buffered.every((r) => r.correct || /supporter took this/i.test(r.answer)),
     buffered.filter((r) => r.correct).length + '/' + buffered.length + ' correct inside the 20s window')
+
+  // The nodes report what each job cost them, so the caller's usage block should
+  // carry real numbers rather than the zeros a relay has nothing to fill in with.
+  const costed = results.filter((r) => (r.usage?.total_tokens ?? 0) > 0)
+  ok('the caller is told what the answer cost', costed.length === buffered.length,
+    costed.length + '/' + buffered.length + ' buffered answers carried a token count')
+  const spend = results.reduce((a, r) => a + (r.usage?.cost_usd ?? 0), 0)
+  console.log(dim('  reported spend across this run: $' + spend.toFixed(4)))
+  summary.reportedSpendUsd = spend
 
   summary.results = results
   summary.latency = stats(results.map((r) => r.totalMs))

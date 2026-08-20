@@ -270,7 +270,7 @@ const relayReq = (body: unknown) => new Request('https://x/api/v1/chat/completio
 
 // A supporter cycle, exactly as the pasted worker brief describes it: poll,
 // answer the last message, deliver. Runs concurrently with the user's request.
-const supporterCycle = async () => {
+const supporterCycle = async (usage?: unknown) => {
   const polled = await workNext(new Request('https://x/api/work/next', {
     method: 'POST', headers: { authorization: `Bearer ${supporterKey}` },
   }))
@@ -279,7 +279,7 @@ const supporterCycle = async () => {
   const delivered = await workComplete(new Request('https://x/api/work/complete', {
     method: 'POST',
     headers: { authorization: `Bearer ${supporterKey}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ id: job.id, text: `echo:${job.messages.at(-1).content}` }),
+    body: JSON.stringify({ id: job.id, text: `echo:${job.messages.at(-1).content}`, usage }),
   }))
   return { polled: polled.status, job, delivered: delivered.status }
 }
@@ -304,6 +304,54 @@ t('delivery is accepted', side.delivered === 200)
 t('user gets the supporter answer', relayRes.status === 200 && relayJson.choices?.[0]?.message?.content === 'echo:ping-relay', JSON.stringify(relayJson.choices?.[0] ?? relayJson))
 t('relay response is OpenAI-shaped', relayJson.object === 'chat.completion' && relayJson.choices[0].finish_reason === 'stop')
 t('provider header names the relay', relayRes.headers.get('x-relaybee-provider') === 'claude-code')
+
+// A node reports what the job cost it and the caller reads it in the usual
+// place. Relaybee never sees the model call, so this is the only source there
+// is: zeros would be the alternative, in a product about cost.
+console.log('%srelay usage - a reported cost reaches the caller, junk does not', String.fromCharCode(10))
+{
+  const good = supporterCycle({ input_tokens: 41, output_tokens: 7, cost_usd: 0.0013 })
+  const res = await chatCompletions(relayReq({ model: 'claude-code', messages: [{ role: 'user', content: 'costed' }] }))
+  await good
+  const json = await res.json()
+  t('the caller sees the reported token counts', json.usage?.prompt_tokens === 41 && json.usage?.completion_tokens === 7, JSON.stringify(json.usage))
+  t('total_tokens is the sum, not another guess', json.usage?.total_tokens === 48)
+  t('and the dollar figure the node actually paid', json.usage?.cost_usd === 0.0013)
+
+  // The numbers come from an untrusted node over the wire. A bad one must not
+  // reach the caller's usage block AND must not cost them their answer.
+  for (const [name, junk] of [
+    ['a negative count', { input_tokens: -5, output_tokens: 1, cost_usd: 0 }],
+    ['a non-number', { input_tokens: '41', output_tokens: 7, cost_usd: 0 }],
+    ['an absurd bill', { input_tokens: 1, output_tokens: 1, cost_usd: 999_999 }],
+    ['a missing field', { input_tokens: 1, output_tokens: 2 }],
+  ] as Array<[string, unknown]>) {
+    const cyc = supporterCycle(junk)
+    const r = await chatCompletions(relayReq({ model: 'claude-code', messages: [{ role: 'user', content: name }] }))
+    await cyc
+    const j = await r.json()
+    t(`${name} is dropped, and the answer still lands`,
+      r.status === 200 && j.choices?.[0]?.message?.content === `echo:${name}` && j.usage?.total_tokens === 0,
+      JSON.stringify(j.usage))
+  }
+}
+
+// stream_options.include_usage is the OpenAI opt-in, and the relay follows the
+// same rule the provider path already does: no opt-in, no trailing chunk.
+{
+  const cyc = supporterCycle({ input_tokens: 9, output_tokens: 3, cost_usd: 0.0004 })
+  const res = await chatCompletions(relayReq({
+    model: 'claude-code', stream: true, stream_options: { include_usage: true },
+    messages: [{ role: 'user', content: 'stream-costed' }],
+  }))
+  await cyc
+  const text = await res.text()
+  t('a streamed caller who opts in gets a trailing usage chunk', /"total_tokens":12/.test(text), text.slice(-220).replace(/%s/g, ' '))
+  const cyc2 = supporterCycle({ input_tokens: 9, output_tokens: 3, cost_usd: 0.0004 })
+  const res2 = await chatCompletions(relayReq({ model: 'claude-code', stream: true, messages: [{ role: 'user', content: 'stream-silent' }] }))
+  await cyc2
+  t('a streamed caller who does not opt in gets no usage chunk', !/total_tokens/.test(await res2.text()))
+}
 
 const cycle2 = supporterCycle()
 const streamRes = await chatCompletions(relayReq({ model: 'claude-code/default', stream: true, messages: [{ role: 'user', content: 'ping-sse' }] }))

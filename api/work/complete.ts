@@ -4,7 +4,7 @@
 // who popped the job holds — so no further assignment bookkeeping is needed.
 
 import { verifyKey, bearer } from '../../lib/auth'
-import { completeJob } from '../../lib/queue'
+import { completeJob, type Usage } from '../../lib/queue'
 import { check, clientIp, rlHeaders } from '../../lib/ratelimit'
 
 export const config = { runtime: 'edge' }
@@ -25,6 +25,31 @@ function json(status: number, obj: unknown, extra: Record<string, string> = {}) 
   })
 }
 
+/**
+ * A node's self-reported cost for the job it just answered.
+ *
+ * The relay never sees the model call, so these numbers can only come from the
+ * node and cannot be checked here. That makes them untrusted input in the
+ * ordinary sense: a nonsense value must not reach the caller's usage block and
+ * must not turn a delivered answer into an error, since the answer is the part
+ * that matters. So anything that is not three sane finite numbers is dropped
+ * and the answer goes through without a usage block, exactly as before.
+ */
+function readUsage(raw: unknown): Usage | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const u = raw as Record<string, unknown>
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null)
+  const inputTokens = num(u.input_tokens)
+  const outputTokens = num(u.output_tokens)
+  const costUsd = num(u.cost_usd)
+  if (inputTokens === null || outputTokens === null || costUsd === null) return undefined
+  // A ceiling so a node cannot report a number that reads as a bill. The relay
+  // caps a job's messages at 32KB and an answer at 64KB, so real counts are
+  // small and anything past this is a bug or a joke either way.
+  if (inputTokens > 10_000_000 || outputTokens > 10_000_000 || costUsd > 1_000) return undefined
+  return { inputTokens, outputTokens, costUsd }
+}
+
 export default async function handler(req: Request): Promise<Response> {
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS })
   if (req.method !== 'POST') return json(405, { error: { message: 'Use POST.' } })
@@ -37,7 +62,7 @@ export default async function handler(req: Request): Promise<Response> {
     return json(429, { error: { message: 'Rate limit exceeded.', type: 'rate_limit_error' } }, rlh)
   }
 
-  let body: { id?: string; text?: string }
+  let body: { id?: string; text?: string; usage?: unknown }
   try {
     body = (await req.json()) as typeof body
   } catch {
@@ -53,7 +78,7 @@ export default async function handler(req: Request): Promise<Response> {
   }
 
   try {
-    await completeJob(id, text)
+    await completeJob(id, text, readUsage(body.usage))
   } catch {
     return json(503, { error: { message: 'Relay queue is temporarily unavailable.', type: 'server_error' } }, rlh)
   }

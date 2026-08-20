@@ -60,7 +60,22 @@ t('a job older than the max age is never handed to a supporter', (await queue.ne
 console.log('\nupstash — answer delivery')
 const answerId = 'result-round-trip'
 await queue.completeJob(answerId, 'the answer')
-t('an answer written by a supporter is read by the waiting caller', (await queue.awaitResult(answerId, 2000)) === 'the answer')
+t('an answer written by a supporter is read by the waiting caller', (await queue.awaitResult(answerId, 2000))?.text === 'the answer')
+
+// A node reports what the job cost it, because the relay never sees the model
+// call and so has nothing of its own to report.
+const costedId = 'result-with-usage'
+await queue.completeJob(costedId, 'costed answer', { inputTokens: 12, outputTokens: 34, costUsd: 0.0021 })
+const costed = await queue.awaitResult(costedId, 2000)
+t('a reported cost survives the round trip', costed?.usage?.inputTokens === 12 && costed?.usage?.outputTokens === 34, JSON.stringify(costed?.usage))
+t('and the answer still comes back with it', costed?.text === 'costed answer')
+
+// An answer written before this envelope existed is a bare string in Redis, and
+// it has to stay readable for RESULT_TTL_S across the deploy that introduces it.
+const legacyId = 'result-pre-envelope'
+await fake.raw(['LPUSH', `relaybee:result:${legacyId}`, 'a bare pre-envelope answer'])
+t('a pre-envelope answer is still delivered, not lost to a parse error',
+  (await queue.awaitResult(legacyId, 2000))?.text === 'a bare pre-envelope answer')
 t('an answer is delivered once, then gone', (await queue.awaitResult(answerId, 300)) === null)
 
 console.log('\nupstash — command cost, which is the whole point of the change')
