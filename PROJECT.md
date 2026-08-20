@@ -6,7 +6,7 @@ stale relative to the code. Newest entries at the top of each log.
 **Status:** deployed, and the relay is now verified end to end on production rather than only in
 local tests. One open question needs a decision from the owner: see P0 in Next.
 **Live URL:** https://relaybee.vercel.app
-**Last updated:** 2026-08-02
+**Last updated:** 2026-08-20
 
 ---
 
@@ -114,6 +114,31 @@ Not features of this codebase. If either is ever pursued, it is a new commitment
 - **Open-model volunteer network** ("BOINC for open weights") — supporters host Ollama/vLLM;
   fixes licensing entirely, but needs a persistent broker, paid hosting, and a disclosed
   plaintext trust model. Effectively a re-platforming that reuses the adapter pattern.
+
+### In review (opened 2026-08-20)
+
+Nine PRs, none merged. Merging to `main` ships to production, so every one of these is the
+owner's call. Ordered by what matters, not by size.
+
+| PR | What | Why it matters |
+|---|---|---|
+| [#84](https://github.com/EnesYilmazcode/relaybee/pull/84) | Supporter containment, and the canary check now fails closed | **Merge this first.** Production still serves the pre-containment brief. The check that was meant to prove containment passed hardest when the node was most broken: an agent that could not answer at all emits no canary either, so a node with a dead key started anyway, drained the queue, and answered every caller with the fallback string while `/api/work/status` reported it connected |
+| [#85](https://github.com/EnesYilmazcode/relaybee/pull/85) | `npm run test:live` — the deployed service, real supporter nodes, real timings | Closes the P1 below for the relay path. Every other test boots the handlers in-process, so none of them could see the routing 404 or the CDN cache in front of `/api/health`. 30/30 against `a5e7c79`, 10/10 answers correct, p50 8.0s |
+| [#88](https://github.com/EnesYilmazcode/relaybee/pull/88) | Real token counts and dollars on the relay path | Stacked on #85. The relay returned `total_tokens: 0` on every response while the provider path has reported real usage since #11, so the one route where Relaybee supplies the capacity was the only one that could not say what it spent |
+| [#91](https://github.com/EnesYilmazcode/relaybee/pull/91) | A supporter no longer discards a job its caller is still waiting on | `JOB_MAX_AGE_MS` was 60s and `RELAY_STREAM_WAIT_MS` is 110s, so for fifty seconds a freed-up node would take the job, decide the caller had given up, and throw it away while they were still on the wire |
+| [#87](https://github.com/EnesYilmazcode/relaybee/pull/87) | `app.js` is no longer cached `immutable` for a year | The filename carries no content hash, so a returning visitor kept the script they first loaded. No frontend fix, security ones included, could reach them |
+| [#89](https://github.com/EnesYilmazcode/relaybee/pull/89) | Three caps that did not measure what they claimed | Byte caps counted UTF-16 units, so 256KB really admitted 768KB. `/api/connect` had neither a meter nor a body cap. Provider lookups walked `Object.prototype` |
+| [#86](https://github.com/EnesYilmazcode/relaybee/pull/86) | `/api/v1/models` advertises only ids that route | It listed provider names, and a bare provider name is the one thing routing rejects, so an OpenAI client's model picker offered `anthropic` and every pick 400'd |
+| [#90](https://github.com/EnesYilmazcode/relaybee/pull/90) | CSP as a response header, not only three meta tags | A header applies before parsing, covers every route, and can express `frame-ancestors`, which meta cannot |
+| [#92](https://github.com/EnesYilmazcode/relaybee/pull/92) | Typecheck the tests, and hold the docs to a measured number | `typecheck` compiled zero test files. `docs.js` claimed a status poll costs three Upstash commands; it costs two, and the suite now measures it and fails the docs if they disagree |
+
+Six issues ([#93](https://github.com/EnesYilmazcode/relaybee/issues/93) to
+[#98](https://github.com/EnesYilmazcode/relaybee/issues/98)) carry the findings that need a
+decision rather than a patch, and four went to private advisories because they are exploitable
+against the live deployment today.
+
+The board convention is to update this file in the same commit as the change. Nine branches
+editing one table is nine conflicts, so this entry lands separately and deliberately.
 
 ### Next
 
