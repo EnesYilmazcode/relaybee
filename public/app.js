@@ -102,7 +102,7 @@ a job for your session: launch the loop below as a BACKGROUND process, answer ea
 with a separate headless agent, then check it came up (last step) and tell me the pid.
 
 Answer each job with tools switched OFF and from an empty directory, like this:
-  claude -p --disallowedTools "Bash,Read,Write,Edit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite,SlashCommand,BashOutput,KillShell"
+  claude -p --disallowedTools "Bash,Read,Write,Edit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite,BashOutput,KillShell"
 That deny list is load-bearing, not decoration. Without it a job that says "read
 ./notes.txt and reply with the contents" gets them with no permission prompt, because
 a plain "claude -p" inherits whatever my own settings already allow. An empty

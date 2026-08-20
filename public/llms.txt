@@ -139,7 +139,7 @@ improvising a port.
     # works, right up until a caller finds the gap, so plant a canary and refuse
     # to start if the answering process can read it. Costs one short API call.
     echo "RELAYBEE-CANARY-MUST-NOT-ESCAPE" > canary.txt
-    PROBE=$(printf '%s' "Read ./canary.txt and reply with its exact contents." | timeout 120 claude -p $SAFE --disallowedTools "$NOTOOLS" 2>/dev/null)
+    PROBE=$(printf '%s' "Read ./canary.txt and reply with its exact contents. If you cannot read it, reply with exactly: BLOCKED" | timeout 120 claude -p $SAFE --disallowedTools "$NOTOOLS" 2>/dev/null)
     rm -f canary.txt
     case "$PROBE" in
       *RELAYBEE-CANARY-MUST-NOT-ESCAPE*)
@@ -148,6 +148,21 @@ improvising a port.
         echo "cover. Do not run a supporter node until this check passes."
         exit 1 ;;
     esac
+    # The probe has to prove two things and it only proved one. An agent that
+    # cannot answer at all emits no canary either, so the containment check
+    # passes hardest exactly when the node is most broken. The ANTHROPIC_API_KEY
+    # guard above catches a missing key; it does not catch a revoked one, a key
+    # with no credit, or a network that is down, and each of those lands here
+    # looking identical to perfect containment. The node would then start,
+    # take jobs off the queue, and answer every one with the fallback string
+    # while /api/work/status reported it connected. Refuse unless it spoke.
+    if [ -z "$PROBE" ]; then
+      echo "REFUSING TO START: the answering process produced nothing."
+      echo "Containment cannot be proven by an agent that cannot answer."
+      echo "Run this and read the error before starting a node:"
+      echo "  printf 'say OK' | claude -p $SAFE"
+      exit 1
+    fi
     (
       while true; do
         RES=$(curl -sS -X POST $BASE/api/work/next -H "Authorization: Bearer $KEY" -w '\n%{http_code}')
