@@ -9,7 +9,7 @@ import { verifyKey, bearer } from './auth'
 import { open, type Connection } from './seal'
 import { route, ADAPTERS, type ChatRequest } from './providers'
 import { check, LIMITS, clientIp, IP_PROXY_LIMIT, rlHeaders } from './ratelimit'
-import { submitJob, awaitResult, cancelJob, countLive, type Job, type Usage } from './queue'
+import { submitJob, awaitResult, cancelJob, countLive, isLive, type Job, type Usage, type Pool } from './queue'
 import { hasSecrets, NOT_CONFIGURED } from './config'
 
 const CORS = {
@@ -85,6 +85,16 @@ export async function listModels(req: Request): Promise<Response> {
 // capacity. Non-streaming in substance; stream:true gets the finished answer as
 // a single SSE chunk so OpenAI clients that always stream still work.
 const RELAY_PROVIDER = 'claude-code'
+// "claude-code" goes to the caller's own nodes. "claude-code/public" offers the
+// job to anyone running a node that has opted into the shared pool.
+//
+// The default used to be the second one, without anyone choosing it: every job
+// went to one global list that any free key could drain. Reading a stranger's
+// prompt and writing a stranger's answer are both things to agree to, so they
+// are now named on both sides.
+const PUBLIC_SUFFIX = 'public'
+const poolFor = (model: string): Pool =>
+  model.slice(RELAY_PROVIDER.length + 1) === PUBLIC_SUFFIX ? 'public' : 'own'
 // The buffered path emits nothing until the answer is complete, so it is bounded
 // by Vercel Edge's ~25s initial-response deadline. Exceed that and a timeout
 // surfaces as platform 504 HTML instead of our clean JSON, so we give up first.
@@ -137,7 +147,8 @@ function flatten(content: unknown): string {
   return ''
 }
 
-async function relayCompletion(body: ChatRequest, headers: Record<string, string>): Promise<Response> {
+async function relayCompletion(body: ChatRequest, owner: string, headers: Record<string, string>): Promise<Response> {
+  const pool = poolFor(body.model)
   // Message elements are unknown-typed from the wire; a null or non-object entry
   // would throw on property access, so coerce defensively rather than trust them.
   const messages: Job['messages'] = body.messages.map((m) => ({
@@ -154,7 +165,7 @@ async function relayCompletion(body: ChatRequest, headers: Record<string, string
 
   let job: Job
   try {
-    job = await submitJob(body.model, messages)
+    job = await submitJob(body.model, messages, owner, pool)
   } catch {
     // A queue-backend hiccup (e.g. transient Upstash 5xx) must not escape as a
     // bare platform 500 with no CORS or error envelope.
@@ -164,7 +175,7 @@ async function relayCompletion(body: ChatRequest, headers: Record<string, string
   const created = Math.floor(Date.now() / 1000)
   const relayHeaders = { ...headers, 'x-relaybee-provider': RELAY_PROVIDER }
 
-  if (body.stream) return relayStream(job, body, created, relayHeaders)
+  if (body.stream) return relayStream(job, body, owner, pool, created, relayHeaders)
 
   let result: Awaited<ReturnType<typeof awaitResult>>
   try {
@@ -175,8 +186,8 @@ async function relayCompletion(body: ChatRequest, headers: Record<string, string
   if (result === null) {
     // Nobody is waiting for this any more. Leaving it queued means the next
     // supporter to connect spends real model time on an answer no one reads.
-    await cancelJob(job).catch(() => {})
-    return err(504, await timedOutMessage(), 'api_error', headers)
+    await cancelJob(job, owner, pool).catch(() => {})
+    return err(504, await timedOutMessage(owner, pool), 'api_error', headers)
   }
 
   return new Response(
@@ -195,14 +206,24 @@ async function relayCompletion(body: ChatRequest, headers: Record<string, string
  * caller to retry while a supporter is mid answer just queues the same prompt
  * twice and spends their tokens twice.
  */
-async function timedOutMessage(known?: boolean): Promise<string> {
+async function timedOutMessage(owner: string, pool: Pool, known?: boolean): Promise<string> {
   let online = known
-  if (online === undefined) {
-    try { online = (await countLive()) > 0 } catch { online = false }
+  if (online === undefined) online = await anyoneCanServe(owner, pool)
+  if (online) {
+    return `A supporter took this and did not finish inside ${RELAY_WAIT_MS / 1000}s. Send "stream": true and Relaybee holds the connection open while they work, which is what long answers need.`
   }
-  return online
-    ? `A supporter took this and did not finish inside ${RELAY_WAIT_MS / 1000}s. Send "stream": true and Relaybee holds the connection open while they work, which is what long answers need.`
-    : 'No supporter is online right now. The relay only answers while someone is running a supporter node, so try again later, or run one yourself.'
+  return pool === 'public'
+    ? 'No node has opted into the public pool right now. Run one yourself, or drop the "/public" suffix to use your own.'
+    : `No node of your own is online. "${RELAY_PROVIDER}" is served by machines running a supporter node under this same API key, so start one, or send "${RELAY_PROVIDER}/${PUBLIC_SUFFIX}" to offer the job to anyone who has opted into the shared pool.`
+}
+
+/** Is there any node that could take this particular job? */
+async function anyoneCanServe(owner: string, pool: Pool): Promise<boolean> {
+  try {
+    return pool === 'public' ? (await countLive()) > 0 : await isLive(owner)
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -211,7 +232,7 @@ async function timedOutMessage(known?: boolean): Promise<string> {
  * wait in slices, sending an SSE comment between them so nothing along the path
  * decides the connection is idle.
  */
-function relayStream(job: Job, body: ChatRequest, created: number, relayHeaders: Record<string, string>): Response {
+function relayStream(job: Job, body: ChatRequest, owner: string, pool: Pool, created: number, relayHeaders: Record<string, string>): Response {
   const includeUsage = (body.stream_options as { include_usage?: unknown } | undefined)?.include_usage === true
   const encoder = new TextEncoder()
   const frame = (o: unknown) => `data: ${JSON.stringify(o)}\n\n`
@@ -243,15 +264,15 @@ function relayStream(job: Job, body: ChatRequest, created: number, relayHeaders:
         // full window would be a worse experience than the old 20s cap.
         if (!checked) {
           checked = true
-          try { online = (await countLive()) > 0 } catch { online = false }
+          online = await anyoneCanServe(owner, pool)
           if (!online) break
         }
         send(': waiting for a supporter\n\n')
       }
 
       if (result === null) {
-        await cancelJob(job).catch(() => {})
-        send(frame({ error: { message: await timedOutMessage(online), type: 'api_error' } }))
+        await cancelJob(job, owner, pool).catch(() => {})
+        send(frame({ error: { message: await timedOutMessage(owner, pool, online), type: 'api_error' } }))
       } else {
         send(frame(chunk({ content: result.text }, null)))
         send(frame(chunk({}, 'stop')))
@@ -320,7 +341,7 @@ async function chatCompletionsInner(req: Request): Promise<Response> {
   }
 
   if (body.model === RELAY_PROVIDER || body.model.startsWith(`${RELAY_PROVIDER}/`)) {
-    return relayCompletion(body, headers)
+    return relayCompletion(body, auth.u, headers)
   }
 
   const routed = route(body.model)

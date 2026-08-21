@@ -1,10 +1,18 @@
 // Supporter side of the relay: deliver an answer for a job taken from /api/work/next.
 //
-// The job id is the capability — an unguessable UUID that only the supporter
-// who popped the job holds — so no further assignment bookkeeping is needed.
+// Delivery needs the ticket /api/work/next issued with the job, not just the job
+// id. The id alone was never proof of anything: it is unguessable, which stops
+// someone inventing one, but this endpoint accepted any well-formed uuid from
+// any key, and the gateway hands the id straight back to the caller as
+// `chatcmpl-<id>`. So an id that leaked once was a licence to write that
+// caller's answer for as long as the job lived.
+//
+// The ticket is an HMAC over the job id and the popping node's user id, checked
+// by recomputing it against the key presenting it. No storage, no extra queue
+// command, and it cannot be replayed by a different key.
 
 import { verifyKey, bearer } from '../../lib/auth'
-import { completeJob, type Usage } from '../../lib/queue'
+import { completeJob, checkTicket, type Usage } from '../../lib/queue'
 import { check, clientIp, rlHeaders } from '../../lib/ratelimit'
 
 export const config = { runtime: 'edge' }
@@ -62,7 +70,7 @@ export default async function handler(req: Request): Promise<Response> {
     return json(429, { error: { message: 'Rate limit exceeded.', type: 'rate_limit_error' } }, rlh)
   }
 
-  let body: { id?: string; text?: string; usage?: unknown }
+  let body: { id?: string; ticket?: string; text?: string; usage?: unknown }
   try {
     body = (await req.json()) as typeof body
   } catch {
@@ -72,6 +80,16 @@ export default async function handler(req: Request): Promise<Response> {
   const id = body.id ?? ''
   const text = body.text ?? ''
   if (!/^[0-9a-f-]{36}$/.test(id)) return json(400, { error: { message: 'Field "id" must be the job id from /api/work/next.' } }, rlh)
+  const ticket = typeof body.ticket === 'string' ? body.ticket : ''
+  if (!ticket) {
+    return json(400, { error: { message: 'Field "ticket" is required. Send back the ticket /api/work/next returned with this job.' } }, rlh)
+  }
+  // 403, not 404: the job may well exist. What is missing is the proof that this
+  // key is the one that took it, and saying so is more useful than pretending
+  // the job is gone.
+  if (!(await checkTicket(id, auth.u, ticket))) {
+    return json(403, { error: { message: 'That ticket was not issued to this key for this job.', type: 'permission_error' } }, rlh)
+  }
   if (!text) return json(400, { error: { message: 'Field "text" is required.' } }, rlh)
   if (new TextEncoder().encode(text).length > MAX_ANSWER_BYTES) {
     return json(400, { error: { message: `Answer too large: cap is ${MAX_ANSWER_BYTES / 1024}KB.` } }, rlh)

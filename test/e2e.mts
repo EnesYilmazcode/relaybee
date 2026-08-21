@@ -96,6 +96,9 @@ async function supporter(key: string) {
   while (workerOn) {
     let res: Response
     try {
+      // No body means the node's own queue, which is where a job submitted
+      // under this same key lands. The supporter here runs on the caller's key
+      // on purpose: that pairing IS the access control now.
       res = await fetch(BASE + '/api/work/next', { method: 'POST', headers: auth })
     } catch { break }
     if (res.status !== 200) continue // 204 (no work) or 429 (backoff) -> poll again
@@ -103,7 +106,8 @@ async function supporter(key: string) {
     const last = job.messages.at(-1)?.content ?? ''
     served.push(last)
     if (answerDelayMs) await new Promise((r) => setTimeout(r, answerDelayMs))
-    await post('/api/work/complete', { id: job.id, text: `SUPPORTER_REPLY: ${last}` }, auth)
+    // The ticket, not just the id, is what proves this node took the job.
+    await post('/api/work/complete', { id: job.id, ticket: job.ticket, text: `SUPPORTER_REPLY: ${last}` }, auth)
   }
 }
 
@@ -138,7 +142,10 @@ console.log('\ne2e — failure (a): claude-code with no supporter online -> clea
   // With nothing polling, the message must say so. The other branch (a supporter
   // is here but slow) is asserted further down, and giving the wrong one is how
   // a caller gets told to retry into a supporter who is already answering.
-  t('the 504 names the real reason: nobody is online', /no supporter is online/i.test(j.error?.message ?? ''), j.error?.message)
+  // "nobody at all" and "nobody of yours" carry opposite advice, and the relay
+  // now routes to the caller's own nodes, so the accurate message is the second.
+  t('the 504 names the real reason: no node of your own', /no node of your own/i.test(j.error?.message ?? ''), j.error?.message)
+  t('and it offers the public pool as the way out', /claude-code[/]public/.test(j.error?.message ?? ''))
   // This caller has now given up. Its job must leave with it, or the supporter
   // started further down would spend real model time answering nobody. That is
   // asserted after the worker has been running: see "abandoned job" below.
@@ -181,7 +188,11 @@ console.log('\ne2e — failure (d): provider model with no X-Relaybee-Connection
 }
 
 // --- now bring a supporter online and run the happy path ---------------------
-const workerTask = supporter(supKey)
+// On the caller's own key, because that is the pairing the relay now routes on:
+// a job goes to its requester's queue and only a node holding that same key can
+// take it. supKey stays a different user, which is what the cross-user blob
+// rejection above needed and what the isolation check below needs.
+const workerTask = supporter(KEY)
 await new Promise((r) => setTimeout(r, 300)) // let the worker start polling
 
 console.log('\ne2e — health sees the supporter online')
@@ -228,6 +239,31 @@ t('the slow stream still terminates with [DONE]', sse4.trimEnd().endsWith('data:
 
 console.log('\ne2e — the abandoned job from failure (a) was never handed to the supporter')
 t('a caller that gave up did not leave work behind', !served.some((s) => s.includes('anyone-home')), JSON.stringify(served))
+
+console.log('\ne2e - a stranger with their own key gets nothing, over real HTTP')
+{
+  // supKey is a different user. Minting one is free and unauthenticated, which
+  // is exactly the position an attacker starts from.
+  const strangerAuth = { authorization: `Bearer ${supKey}`, 'x-forwarded-for': '10.7.7.7', 'content-type': 'application/json' }
+  const callerAsks = post('/api/v1/chat/completions', {
+    model: 'claude-code', messages: [{ role: 'user', content: 'SECRET_PROMPT_FOR_OWNER_ONLY' }],
+  }, clientAuth)
+
+  const drain = await fetch(BASE + '/api/work/next', {
+    method: 'POST', headers: strangerAuth, body: JSON.stringify({ pool: 'public' }),
+  })
+  t('a stranger long-polling gets no job', drain.status === 204, `status=${drain.status}`)
+
+  const answer = await (await callerAsks).json()
+  t('and the node holding the owner key answered it instead',
+    /SUPPORTER_REPLY/.test(answer.choices?.[0]?.message?.content ?? ''),
+    JSON.stringify(answer.choices?.[0]?.message?.content))
+
+  // The caller was handed chatcmpl-<job id>, so the id is public by design.
+  const leakedId = String(answer.id ?? '').replace(/^chatcmpl-/, '')
+  const inject = await post('/api/work/complete', { id: leakedId, ticket: 'made-up', text: 'INJECTED' }, strangerAuth)
+  t('and the leaked job id does not let a stranger write an answer', inject.status === 403, `status=${inject.status}`)
+}
 
 console.log('\ne2e — bring-your-own-keys path against a fake provider')
 // Intercept only the provider endpoint; everything else uses real fetch.

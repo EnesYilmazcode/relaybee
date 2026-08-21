@@ -14,6 +14,9 @@ process.env.UPSTASH_REDIS_REST_TOKEN = fake.token
 process.env.MASTER_SECRET = 'upstash-test-secret'
 
 const queue = await import('../lib/queue.ts')
+// Every job belongs to a requester now, and a node only ever sees its own
+// queue. These tests act as one user throughout unless they say otherwise.
+const OWNER = 'upstash_owner'
 const { issueKey } = await import('../lib/auth.ts')
 
 let failed = 0
@@ -26,36 +29,37 @@ console.log('\nupstash — the real REST path, not the memory fallback')
 t('the queue selected the Upstash store', queue.QUEUE_DISTRIBUTED === true)
 
 console.log('\nupstash — job round trip')
-const submitted = await queue.submitJob('claude-code', [{ role: 'user', content: 'hello upstash' }])
-const popped = await queue.nextJob(2000)
+const submitted = await queue.submitJob('claude-code', [{ role: 'user', content: 'hello upstash' }], OWNER)
+const popped = await queue.nextJob(2000, OWNER)
 t('a submitted job comes back off the REST queue', popped?.id === submitted.id, popped?.id ?? 'none')
 t('the job carries its messages intact', popped?.messages[0]?.content === 'hello upstash')
-t('the queue is empty once popped', (await queue.nextJob(1000)) === null)
+t('the queue is empty once popped', (await queue.nextJob(1000, OWNER)) === null)
 
 console.log('\nupstash — a caller that gives up takes its job with it')
 // Without this, a job abandoned after 15s still looks fresh to the age trim for
 // another 45, so the next supporter to connect burns real model time on it.
-const abandoned = await queue.submitJob('claude-code', [{ role: 'user', content: 'nobody is waiting for this' }])
+const abandoned = await queue.submitJob('claude-code', [{ role: 'user', content: 'nobody is waiting for this' }], OWNER)
 fake.reset()
-await queue.cancelJob(abandoned)
+await queue.cancelJob(abandoned, OWNER)
 t('cancelling costs one command', fake.total() === 1, `${fake.total()}`)
-t('the abandoned job is gone, so no supporter can be handed it', (await queue.nextJob(1200)) === null)
+t('the abandoned job is gone, so no supporter can be handed it', (await queue.nextJob(1200, OWNER)) === null)
 
 // Cancelling a job a supporter already took must be a harmless no-op, not an error.
-const taken = await queue.submitJob('claude-code', [{ role: 'user', content: 'already popped' }])
-const gotIt = await queue.nextJob(2000)
+const taken = await queue.submitJob('claude-code', [{ role: 'user', content: 'already popped' }], OWNER)
+const gotIt = await queue.nextJob(2000, OWNER)
 t('the supporter got the job first', gotIt?.id === taken.id)
-await queue.cancelJob(taken)
+await queue.cancelJob(taken, OWNER)
 t('cancelling an already-popped job is harmless', true)
 
 console.log('\nupstash — stale jobs are dropped (regression guard for #55)')
 // Push a job older than JOB_MAX_AGE_MS straight into the store, the way a queue
 // that filled while nobody was online would look.
-await fake.raw(['LPUSH', 'relaybee:jobs', JSON.stringify({
+// The key name encodes the requester now, which is the isolation itself.
+await fake.raw(['LPUSH', `relaybee:jobs:u:${OWNER}`, JSON.stringify({
   id: 'stale-1', model: 'claude-code', messages: [{ role: 'user', content: 'old' }],
   queuedAt: Date.now() - 5 * 60_000,
 })])
-t('a job older than the max age is never handed to a supporter', (await queue.nextJob(1500)) === null)
+t('a job older than the max age is never handed to a supporter', (await queue.nextJob(1500, OWNER)) === null)
 
 console.log('\nupstash — answer delivery')
 const answerId = 'result-round-trip'
@@ -134,13 +138,16 @@ const workNext = (await import('../api/work/next.ts')).default
 const pollReq = (k: string) => new Request('https://x/api/work/next', {
   method: 'POST', headers: { authorization: `Bearer ${k}` },
 })
-const beatKey = await issueKey('beat_user', 'free')
+// The node polls its OWN queue, so the job has to be queued under the same user
+// the key names. Under the old global list any user id would have done.
+const BEAT_USER = 'beat_user'
+const beatKey = await issueKey(BEAT_USER, 'free')
 // Queue a job before each poll so BRPOP returns at once instead of blocking.
-await queue.submitJob('claude-code', [{ role: 'user', content: 'beat one' }])
+await queue.submitJob('claude-code', [{ role: 'user', content: 'beat one' }], BEAT_USER)
 fake.reset()
 await workNext(pollReq(beatKey))
 t('a first poll marks presence', (fake.counts.get('ZADD') ?? 0) === 1, String(fake.counts.get('ZADD')))
-await queue.submitJob('claude-code', [{ role: 'user', content: 'beat two' }])
+await queue.submitJob('claude-code', [{ role: 'user', content: 'beat two' }], BEAT_USER)
 await workNext(pollReq(beatKey))
 t('an immediate second poll does not pay for it again', (fake.counts.get('ZADD') ?? 0) === 1, String(fake.counts.get('ZADD')))
 t('the second poll still returned its job', true)

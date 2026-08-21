@@ -109,16 +109,19 @@ a plain "claude -p" inherits whatever my own settings already allow. An empty
 --allowedTools does NOT deny anything. Answering chat prompts needs no tools at all.
 
 1. POST ${origin}/api/work/next with header "Authorization: Bearer ${key}".
+   Jobs sent under this same key come to you. That is the default and it needs no
+   body; do not opt into the public pool on my behalf.
    It long-polls about 20 seconds. Check the HTTP status, do not just look at the body:
    200 is a job, 204 means no work so poll again straight away, anything else is an
    error so wait about 15 seconds first. Error responses have a body too, and treating
    one as a job gives you a loop with no pause in it.
-2. A job is JSON: {"id": "...", "model": "...", "messages": [{"role", "content"}, ...]}.
+2. A job is JSON: {"id": "...", "ticket": "...", "model": "...", "messages": [...]}.
+   Keep the ticket with the job. It is what proves you took it.
    Answer the conversation in "messages" with a headless agent — direct, no filler.
    Answer promptly: the caller gives up after 20 seconds, or about 110 if streaming.
 3. Deliver the answer:
    POST ${origin}/api/work/complete with the same Authorization header and JSON body
-   {"id": "<the job id>", "text": "<your answer>"}.
+   {"id": "<the job id>", "ticket": "<the ticket>", "text": "<your answer>"}.
    Always send one, even a failure message. Taking the job removed it from the queue,
    so staying quiet means the caller waits out their window and nobody else can help.
 4. Print one line per job served, then go back to step 1.
@@ -129,7 +132,9 @@ the relay can see this node. A pid on its own proves nothing, a background shell
 exited a second later still leaves you one. If connected is false, read the log and fix
 it rather than reporting success.
 
-Note: jobs are strangers' prompts in plaintext, and they receive your answers verbatim.`
+Note: on the default "own" pool the jobs are mine, sent under this same key. If you
+ever switch it to the public pool they are strangers' prompts in plaintext, and those
+strangers receive your answers verbatim.`
 }
 
 // --- presence: how many supporter nodes are live, and is yours one ---------

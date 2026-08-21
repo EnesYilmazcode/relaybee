@@ -175,6 +175,10 @@ improvising a port.
           *)   echo "poll failed ($CODE), waiting 15s"; sleep 15; continue ;;
         esac
         ID=$(printf '%s' "$BODY" | jq -r '.id // empty')
+        # The ticket is the proof this node took this job. /api/work/complete
+        # rejects a delivery without it, because the job id alone is not proof:
+        # the caller is handed the same id back as chatcmpl-<id>.
+        TICKET=$(printf '%s' "$BODY" | jq -r '.ticket // empty')
         [ -n "$ID" ] || { sleep 5; continue; }
         PROMPT=$(printf '%s' "$BODY" | jq -r '[.messages[].content] | join("\n")')
         # --disallowedTools is the part that matters. An empty --allowedTools
@@ -188,7 +192,7 @@ improvising a port.
         [ -n "$ANSWER" ] || ANSWER="This supporter node could not produce an answer."
         curl -sS -X POST $BASE/api/work/complete -H "Authorization: Bearer $KEY" \
           -H 'content-type: application/json' \
-          -d "$(jq -n --arg id "$ID" --arg text "$ANSWER" '{id:$id,text:$text}')" >/dev/null
+          -d "$(jq -n --arg id "$ID" --arg ticket "$TICKET" --arg text "$ANSWER" '{id:$id,ticket:$ticket,text:$text}')" >/dev/null
         echo "answered $ID at $(date)"
         DONE=$((DONE + 1))
         if [ "$DONE" -ge "$MAXJOBS" ]; then
@@ -231,11 +235,25 @@ a. Ask for the next job:
 
        POST <base>/api/work/next
        Authorization: Bearer <key>
+       Content-Type: application/json
+
+       { "pool": "own" }
 
    This long-polls for about 20 seconds. A 204 or empty response means no work
    right now, so call it again. A 200 returns a job:
 
-       { "id": "<uuid>", "model": "...", "messages": [ { "role": "...", "content": "..." }, ... ] }
+       { "id": "<uuid>", "ticket": "<opaque>", "model": "...",
+         "messages": [ { "role": "...", "content": "..." }, ... ] }
+
+   `pool` decides whose jobs you are willing to answer, and "own" is the default
+   if you send no body at all. "own" means jobs submitted under this same API
+   key: your machine serving your own calls. `{"pool":"public"}` also watches the
+   shared pool, where callers who sent the model `claude-code/public` have
+   offered their job to anyone. Do not opt into that on someone's behalf. It
+   means reading strangers' prompts in plaintext and having strangers read
+   whatever your machine writes back, and it is the human's call to make.
+
+   The `ticket` is what proves this node took this job. Keep it with the job.
 
 b. Answer the conversation in `messages` with a headless agent. Be direct, no
    filler.
@@ -246,7 +264,12 @@ c. Deliver the answer:
        Authorization: Bearer <key>
        Content-Type: application/json
 
-       { "id": "<the job id>", "text": "<your answer>" }
+       { "id": "<the job id>", "ticket": "<the ticket from (a)>", "text": "<your answer>" }
+
+   Without the ticket this is a 400, and with someone else's it is a 403. The
+   job id on its own was never proof of anything: it is unguessable, but the
+   gateway returns it to the caller as `chatcmpl-<id>`, so an id that leaks once
+   would otherwise let anyone write that caller's answer.
 
 d. Log one short line per job, then go back to (a).
 

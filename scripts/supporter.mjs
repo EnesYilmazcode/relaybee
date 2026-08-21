@@ -67,6 +67,11 @@ const ERROR_BACKOFF_MS = 15_000
 // strangers on a subscription.
 const OWN_TRAFFIC_ONLY = flag('own-traffic-only')
 
+// 'own' answers only jobs sent under this same API key, which is the personal
+// capacity router this project settled on. 'public' also takes jobs from callers
+// who explicitly offered them to anyone.
+const POOL = args.get('pool') === 'public' ? 'public' : 'own'
+
 let KEY = args.get('key') ?? process.env.RELAYBEE_KEY ?? ''
 
 const now = () => Date.now()
@@ -178,7 +183,11 @@ function render(messages) {
 async function poll() {
   const res = await fetch(`${BASE}/api/work/next`, {
     method: 'POST',
-    headers: { authorization: `Bearer ${KEY}` },
+    headers: { authorization: `Bearer ${KEY}`, 'content-type': 'application/json' },
+    // Own queue unless asked otherwise. Jobs submitted under this same key come
+    // here; --pool public also watches the shared pool, which means reading
+    // strangers' prompts and having them read your answers.
+    body: JSON.stringify({ pool: POOL }),
   })
   // Status, not body shape. An error response has a body too, and reading one as
   // a job gives you a hot loop with no pause in it.
@@ -190,11 +199,12 @@ async function poll() {
   return res.json()
 }
 
-async function deliver(id, text, usage) {
+async function deliver(id, ticket, text, usage) {
   const res = await fetch(`${BASE}/api/work/complete`, {
     method: 'POST',
     headers: { authorization: `Bearer ${KEY}`, 'content-type': 'application/json' },
-    body: JSON.stringify(usage ? { id, text, usage } : { id, text }),
+    // The ticket is the proof this node took the job. The id alone is not.
+    body: JSON.stringify(usage ? { id, ticket, text, usage } : { id, ticket, text }),
   })
   if (!res.ok) throw new Error(`complete ${res.status}: ${(await res.text()).slice(0, 200)}`)
 }
@@ -224,8 +234,11 @@ async function main() {
   const cwd = await mkdtemp(join(tmpdir(), 'relaybee-supporter-'))
   const probe = await proveContainment(cwd)
   log(`containment proven, the agent answered the canary probe with ${JSON.stringify(probe.slice(0, 40))}`)
-  log(`polling ${BASE}, answering with \`${AGENT} -p\` in ${cwd}, at most ${MAX_JOBS} job(s)`)
-  await telemetry({ event: 'node_start', base: BASE, cwd, ownTrafficOnly: OWN_TRAFFIC_ONLY })
+  log(`polling ${BASE} for ${POOL === 'public' ? 'your own jobs and the public pool' : 'your own jobs'}, answering with \`${AGENT} -p\` in ${cwd}, at most ${MAX_JOBS} job(s)`)
+  if (POOL === 'public') {
+    log('--pool public: strangers can send you prompts and will read your answers.')
+  }
+  await telemetry({ event: 'node_start', base: BASE, cwd, pool: POOL, ownTrafficOnly: OWN_TRAFFIC_ONLY })
 
   let served = 0
   while (served < MAX_JOBS) {
@@ -259,7 +272,7 @@ async function main() {
     const answeredAt = now()
 
     try {
-      await deliver(job.id, text, usage)
+      await deliver(job.id, job.ticket, text, usage)
     } catch (e) {
       log('deliver failed:', e.message)
       await telemetry({ event: 'deliver_error', jobId: job.id, message: e.message })

@@ -260,7 +260,12 @@ console.log('\nsupporter relay — claude-code jobs round-trip through the queue
 const workNext = (await import('../api/work/next.ts')).default
 const workComplete = (await import('../api/work/complete.ts')).default
 const userKey = await issueKey('relay_user', 'free')
-const supporterKey = await issueKey('supporter_1', 'free')
+// The SAME user id, a different key string: one person's app calling, and that
+// same person's machine answering. That pairing is the whole access control now.
+// A job goes to its requester's own queue, so a node holding a key for anyone
+// else simply never sees it.
+const supporterKey = await issueKey('relay_user', 'free')
+const strangerKey = await issueKey('some_stranger', 'free')
 
 const relayReq = (body: unknown) => new Request('https://x/api/v1/chat/completions', {
   method: 'POST',
@@ -270,16 +275,25 @@ const relayReq = (body: unknown) => new Request('https://x/api/v1/chat/completio
 
 // A supporter cycle, exactly as the pasted worker brief describes it: poll,
 // answer the last message, deliver. Runs concurrently with the user's request.
-const supporterCycle = async (usage?: unknown) => {
-  const polled = await workNext(new Request('https://x/api/work/next', {
-    method: 'POST', headers: { authorization: `Bearer ${supporterKey}` },
+// The poll limiter meters per source, so give each block its own address or a
+// later block inherits an earlier one's exhausted bucket and fails for the wrong
+// reason. Distinct addresses here are test hygiene, not part of what is asserted.
+let pollIp = 0
+const pollAs = (key: string, pool: 'own' | 'public' = 'own', ip = `198.51.100.${++pollIp % 250}`) =>
+  workNext(new Request('https://x/api/work/next', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', 'x-forwarded-for': ip },
+    body: JSON.stringify({ pool }),
   }))
+
+const supporterCycle = async (usage?: unknown, key = supporterKey, pool: 'own' | 'public' = 'own') => {
+  const polled = await pollAs(key, pool)
   if (polled.status !== 200) return { polled: polled.status, job: null as any, delivered: 0 }
   const job = await polled.json()
   const delivered = await workComplete(new Request('https://x/api/work/complete', {
     method: 'POST',
-    headers: { authorization: `Bearer ${supporterKey}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ id: job.id, text: `echo:${job.messages.at(-1).content}`, usage }),
+    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ id: job.id, ticket: job.ticket, text: `echo:${job.messages.at(-1).content}`, usage }),
   }))
   return { polled: polled.status, job, delivered: delivered.status }
 }
@@ -395,7 +409,8 @@ await workNext(new Request('https://x/api/work/next', { method: 'POST', headers:
 t('a second live node raises the count', (await countLive()) >= baseline + 1)
 
 console.log('\nwork endpoints — consistent rate-limit headers and CORS exposure')
-const rlKey = await issueKey('rl_headers_user', 'free')
+const rlUser = 'rl_headers_user'
+const rlKey = await issueKey(rlUser, 'free')
 const hasRl = (r: Response) =>
   r.headers.get('x-ratelimit-limit') !== null &&
   r.headers.get('x-ratelimit-remaining') !== null &&
@@ -425,7 +440,9 @@ t('complete exposes rate-limit headers to browsers', exposesRl(completeHdrRes))
 
 // /api/work/next: queue a job first so the long-poll returns 200 immediately
 // (an empty poll would hold the full window), then assert the headers ride along.
-await submitJob('claude-code', [{ role: 'user', content: 'rl-header-warm' }])
+// Queued under rlUser, and rlKey is rlUser's key, so the poll below finds it.
+// Under the old global queue any key would have; that is the point of the change.
+await submitJob('claude-code', [{ role: 'user', content: 'rl-header-warm' }], rlUser)
 const nextHdrRes = await workNext(new Request('https://x/api/work/next', {
   method: 'POST',
   headers: { authorization: `Bearer ${rlKey}`, 'x-forwarded-for': '203.0.113.7' },
@@ -830,6 +847,105 @@ for (const f of ['demo.html', 'demo.css', 'demo.js']) {
 t('no page links to the demo', ![indexHtml, docsHtml, notFoundHtml].some((s) => s.includes('demo.html')))
 t('the homepage footer is docs and source only', (indexHtml.match(/<footer>[\s\S]*?<\/footer>/)?.[0].match(/<a /g) || []).length === 2)
 t('the supporter toggle reads Support', />Support</.test(indexHtml))
+
+// The relay used to be one global list. Anyone could mint a free key at the
+// unauthenticated /api/keys/issue and long-poll it, and that was enough to read
+// every caller's prompt in plaintext and to write whatever answer they liked
+// back. Neither half needed a bug. These are the checks that keep it shut.
+console.log('%srelay isolation - a stranger with their own key gets nothing', String.fromCharCode(10))
+{
+  // Everything here runs concurrently on purpose. A poll that finds nothing
+  // holds for the full 15s window, and the caller gives up at 20s, so doing
+  // these one after another would time the caller out and test nothing.
+  const jobPromise = chatCompletions(relayReq({ model: 'claude-code', messages: [{ role: 'user', content: 'private-prompt-do-not-leak' }] }))
+  const strangerOwn = pollAs(strangerKey)
+  const strangerPublic = pollAs(strangerKey, 'public')
+
+  const mine = await pollAs(supporterKey)
+  const job = await mine.json()
+  t('the node holding the owner key does get it', mine.status === 200 && job.messages.at(-1).content === 'private-prompt-do-not-leak', `status=${mine.status}`)
+  t('and the job still carries no requester identity', !JSON.stringify(job).includes('relay_user'))
+  t('the job comes with a ticket', typeof job.ticket === 'string' && job.ticket.length > 20)
+
+  // The job id leaks by design: the caller is handed chatcmpl-<id>. So knowing
+  // it, and even holding the real ticket, must not be enough for another key.
+  const forged = await workComplete(new Request('https://x/api/work/complete', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${strangerKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ id: job.id, ticket: job.ticket, text: 'INJECTED BY A STRANGER' }),
+  }))
+  t('a stranger replaying the real ticket is refused', forged.status === 403, `status=${forged.status}`)
+
+  const noTicket = await workComplete(new Request('https://x/api/work/complete', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${supporterKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ id: job.id, text: 'no ticket' }),
+  }))
+  t('delivering without a ticket is refused', noTicket.status === 400, `status=${noTicket.status}`)
+
+  const badTicket = await workComplete(new Request('https://x/api/work/complete', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${supporterKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ id: job.id, ticket: job.ticket.slice(0, -1) + (job.ticket.slice(-1) === 'A' ? 'B' : 'A'), text: 'tampered' }),
+  }))
+  t('a tampered ticket is refused', badTicket.status === 403, `status=${badTicket.status}`)
+
+  const good = await workComplete(new Request('https://x/api/work/complete', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${supporterKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ id: job.id, ticket: job.ticket, text: 'answered by the owner' }),
+  }))
+  t('the node holding the real ticket delivers fine', good.status === 200, `status=${good.status}`)
+
+  const answer = await (await jobPromise).json()
+  t('and the caller receives that answer, not the injected one',
+    answer.choices?.[0]?.message?.content === 'answered by the owner',
+    JSON.stringify(answer.choices?.[0]?.message?.content))
+
+  t('a stranger polling their own queue saw nothing', (await strangerOwn).status === 204, `status=${(await strangerOwn).status}`)
+  t('and opting into the public pool did not reach a private job', (await strangerPublic).status === 204, `status=${(await strangerPublic).status}`)
+}
+
+// Answering for strangers still exists. It is now named by both sides.
+console.log('%srelay public pool - opt-in on both ends, or it does not happen', String.fromCharCode(10))
+{
+  const callPromise = chatCompletions(new Request('https://x/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${userKey}` },
+    body: JSON.stringify({ model: 'claude-code/public', messages: [{ role: 'user', content: 'offered-to-anyone' }] }),
+  }))
+  const notOptedIn = pollAs(strangerKey)
+
+  const optedIn = await pollAs(strangerKey, 'public')
+  t('a node that opted into the pool gets a job offered to anyone', optedIn.status === 200, `status=${optedIn.status}`)
+  const pjob = await optedIn.json()
+  await workComplete(new Request('https://x/api/work/complete', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${strangerKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ id: pjob.id, ticket: pjob.ticket, text: 'answered by a volunteer' }),
+  }))
+  const pres = await (await callPromise).json()
+  t('and the caller who asked for the pool gets that answer',
+    pres.choices?.[0]?.message?.content === 'answered by a volunteer',
+    JSON.stringify(pres.choices?.[0]?.message?.content))
+  t('a node that did NOT opt in saw nothing', (await notOptedIn).status === 204, `status=${(await notOptedIn).status}`)
+}
+
+// "Nobody is online" and "nobody of YOURS is online" have opposite advice, so
+// the 504 has to say which one it is.
+console.log('%srelay timeout copy - the message names the real problem', String.fromCharCode(10))
+{
+  const lonely = await issueKey('lonely_caller')
+  const res = await chatCompletions(new Request('https://x/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${lonely}` },
+    body: JSON.stringify({ model: 'claude-code', messages: [{ role: 'user', content: 'anyone?' }] }),
+  }))
+  const body = await res.json()
+  t('a caller with no node of their own is told exactly that',
+    res.status === 504 && /no node of your own/i.test(body.error.message), body.error.message.slice(0, 60))
+  t('and is pointed at the public pool as the alternative', /claude-code[/]public/.test(body.error.message))
+}
 
 console.log(failed === 0 ? '\nall checks passed\n' : `\n${failed} check(s) failed\n`)
 process.exit(failed === 0 ? 0 : 1)
