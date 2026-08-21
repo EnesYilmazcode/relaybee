@@ -11,11 +11,13 @@
     "test:e2e": "tsx test/e2e.mts",
     "check": "npm run typecheck && npm test && npm run test:upstash && npm run test:e2e && npm run test:adversary",
     "test:live": "tsx test/live-e2e.mts",
-    "test:adversary": "tsx test/adversary.mts"
+    "test:adversary": "tsx test/adversary.mts",
+    "coverage": "c8 --reporter=text --src=lib --src=api --include=lib/** --include=api/** --all --clean=false npm run check"
   },
   "devDependencies": {
     "typescript": "^5.6.3",
     "tsx": "^4.19.2",
-    "@types/node": "^22.7.5"
+    "@types/node": "^22.7.5",
+    "c8": "^10.1.3"
   }
 }

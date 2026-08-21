@@ -50,6 +50,15 @@ path through the API and is documented on the docs page; it just has no UI.
   Run it before changing the connect line in `app.js` or the wording of `llms.txt` — both are
   load-bearing and the obvious phrasing measurably does not work. An agent's fetch tool caches,
   so use a fresh port per batch or you are measuring the previous edit.
+- `npm run coverage` runs the whole gate under c8 and prints what never executed. Use it before
+  claiming anything is dead: grep answers "nothing references this name", which is a different
+  question from "this never runs". Measured 2026-08-20: **95.9% of statements, 99.2% of functions**,
+  and every function that never runs is an `export const config` marker Vercel reads at build time.
+  There is no dead code in `lib/` or `api/`; uncovered lines are reachable error paths, so treat a
+  new one as a missing test rather than as something to delete.
+- `npm run test:adversary` mints its own keys and attacks the service. Every check passes only when
+  an attack **fails**. It boots the handlers on an ephemeral port, needs no credential and makes no
+  model calls, so it runs in the gate.
 - `npm run check` = `tsc --noEmit` + `test/smoke.mts` + `test/upstash.mts` (the real Upstash
   path against a fake REST server that counts Redis commands, so cost claims are asserted, not
   argued). It must pass before any commit. Add assertions when you add behavior. Exact counts
