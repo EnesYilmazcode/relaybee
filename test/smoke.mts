@@ -528,9 +528,13 @@ t('vercel: the header CSP forbids framing, which meta cannot',
 const assetRule = (vercelCfg.headers ?? []).find((h: any) =>
   /app\.css/.test(h.source) && /app\.js/.test(h.source) && /favicon\.svg/.test(h.source))
 t('vercel: static asset cache rule exists', !!assetRule)
-t('vercel: static assets are immutable long-cache',
-  /immutable/.test(headerVal(assetRule, 'Cache-Control') ?? '') &&
-  /max-age=31536000/.test(headerVal(assetRule, 'Cache-Control') ?? ''))
+// This used to assert `immutable, max-age=31536000`, which was the bug rather
+// than the requirement: public/ filenames carry no content hash, so that pinned
+// a returning visitor to the app.js they first loaded for a year. The assets
+// must revalidate; see the dedicated block near the end of this file.
+t('vercel: static assets revalidate rather than pinning the visitor',
+  /must-revalidate|no-cache/.test(headerVal(assetRule, 'Cache-Control') ?? '') &&
+  !/immutable/.test(headerVal(assetRule, 'Cache-Control') ?? ''))
 console.log('\nopenai adapter — OpenAI-shaped passthrough with a re-stamped model')
 // translateRequest spreads the caller's body and overwrites only the model
 // (the prefix is stripped upstream), preserving every other field verbatim.
@@ -988,6 +992,28 @@ console.log('\nmodels - every advertised id is one the router accepts')
   )
   t('a bare provider name is NOT advertised as a model', !body.data.some((m) => m.id in ADAPTERS))
   t('the providers are still reported, separately', body.providers.length === Object.keys(ADAPTERS).length)
+
+// The filenames under public/ carry no content hash, so a long immutable cache
+// pins a returning visitor to whatever app.js they first loaded. Every frontend
+// fix, security ones included, then has no way to reach them: the HTML updates,
+// the script URL does not change, and the browser is entitled not to ask again.
+console.log('%sno unversioned asset is cached immutably', String.fromCharCode(10))
+{
+  const vercelJson = JSON.parse(readFileSync(new URL('../vercel.json', import.meta.url), 'utf8')) as {
+    headers: Array<{ source: string; headers: Array<{ key: string; value: string }> }>
+  }
+  const caches = vercelJson.headers.flatMap((h) =>
+    h.headers.filter((x) => x.key.toLowerCase() === 'cache-control').map((x) => ({ source: h.source, value: x.value })),
+  )
+  t('vercel.json still sets a cache policy on the assets', caches.length > 0, `${caches.length} rule(s)`)
+  const hashed = (src: string) => /[.-][0-9a-f]{8,}\./i.test(src)
+  const offenders = caches.filter((c) => !hashed(c.source) && /immutable|max-age=[1-9]\d{4,}/.test(c.value))
+  t('none of them is immutable or long-lived', offenders.length === 0, offenders.map((o) => `${o.source} -> ${o.value}`).join('; '))
+  t(
+    'every served script and stylesheet is covered by a cache rule',
+    ['app.js', 'app.css', 'docs.js', 'docs.css'].every((f) => caches.some((c) => c.source.includes(f))),
+    caches.map((c) => c.source).join(' '),
+  )
 }
 
 console.log(failed === 0 ? '\nall checks passed\n' : `\n${failed} check(s) failed\n`)
