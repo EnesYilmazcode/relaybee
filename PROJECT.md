@@ -6,7 +6,7 @@ stale relative to the code. Newest entries at the top of each log.
 **Status:** deployed, and the relay is now verified end to end on production rather than only in
 local tests. One open question needs a decision from the owner: see P0 in Next.
 **Live URL:** https://relaybee.vercel.app
-**Last updated:** 2026-08-04
+**Last updated:** 2026-08-20
 
 ---
 
@@ -116,6 +116,71 @@ Not features of this codebase. If either is ever pursued, it is a new commitment
 - **Open-model volunteer network** ("BOINC for open weights") — supporters host Ollama/vLLM;
   fixes licensing entirely, but needs a persistent broker, paid hosting, and a disclosed
   plaintext trust model. Effectively a re-platforming that reuses the adapter pattern.
+
+### In review (opened 2026-08-20)
+
+Everything below is on one branch, `feat/relay-private-pools`, which is the merge of
+the individually-reviewable PRs plus the relay isolation work that came out of attacking
+the service. Merging to `main` ships to production, so it is the owner's call.
+
+The single most important item, and the reason to look at this at all:
+
+> **Anyone could mint a free key and read every caller's prompt.** `/api/keys/issue` is
+> unauthenticated by design, the relay was one global queue, and `/api/work/next` handed
+> jobs to whoever asked first. So a stranger could drain the queue, read prompts in
+> plaintext, and write an answer of their choosing back into someone else's application.
+> Neither half needed a bug. It was what the design said to do.
+>
+> A job now goes to its requester's own queue and only a node holding that same key can
+> take it, which is the *personal capacity router* the design review already settled on.
+> Answering for strangers still exists and is now named on both ends: the caller sends
+> `claude-code/public`, the node sends `{"pool":"public"}`.
+
+| PR | What |
+|---|---|
+| [#84](https://github.com/EnesYilmazcode/relaybee/pull/84) | Supporter containment, and the canary check now fails closed. It passed hardest when the node was most broken |
+| [#85](https://github.com/EnesYilmazcode/relaybee/pull/85) | `npm run test:live` — the deployed service, real nodes, real timings. 30/30 against `a5e7c79`, 10/10 answers correct, p50 8.0s |
+| [#88](https://github.com/EnesYilmazcode/relaybee/pull/88) | Real token counts and dollars on the relay path. It reported `total_tokens: 0` |
+| [#91](https://github.com/EnesYilmazcode/relaybee/pull/91) | A supporter no longer discards a job its caller is still waiting on, and the SSE parser can read a CRLF stream |
+| [#87](https://github.com/EnesYilmazcode/relaybee/pull/87) | `app.js` is no longer cached `immutable` for a year on an unhashed filename |
+| [#89](https://github.com/EnesYilmazcode/relaybee/pull/89) | Three caps that did not measure what they claimed: UTF-16 byte counts, an unmetered `/api/connect`, prototype-chain provider lookups |
+| [#86](https://github.com/EnesYilmazcode/relaybee/pull/86) | `/api/v1/models` advertises only ids that route |
+| [#90](https://github.com/EnesYilmazcode/relaybee/pull/90) | CSP as a response header, not only three meta tags |
+| [#92](https://github.com/EnesYilmazcode/relaybee/pull/92) | Typecheck the tests, and hold the docs to a measured number |
+
+### The adversary suite
+
+`npm run test:adversary` mints its own keys and attacks the service. It boots the real
+handlers on an ephemeral port, needs no deployment, no credential and no operator, and
+makes no model calls, so it gates every push. Every check passes only when an attack
+**fails**; a line reading BREACH is a finding.
+
+    22/22 defences held in 16.8s
+    no attack in this suite got anything it should not have
+
+It covers: draining another user's queue, injecting an answer using the job id the
+gateway publishes as `chatcmpl-<id>`, replaying a real ticket under a different key,
+five shapes of key forgery, replaying someone else's sealed connection, amplifying one
+request into eight upstream calls, a multibyte body that is under the cap by character
+count and 3x over it in bytes, and finding an endpoint with no meter.
+
+That last one is why it exists rather than being a document: it found two real gaps the
+first time it ran, on a branch that was missing #89.
+
+### Findings closed alongside
+
+- **Advisories.** Four were filed privately. The uncontained supporter brief is #84; the
+  job id not being a capability is the ticket in this branch; the `/api/work/status`
+  budget drain is a 4x lower ceiling plus a shared count cache; the pool-walk key oracle
+  is now metered per connection rather than per request, so eight upstream calls cost eight.
+- **Issues.** [#93](https://github.com/EnesYilmazcode/relaybee/issues/93) one key now has
+  exactly one valid spelling. [#94](https://github.com/EnesYilmazcode/relaybee/issues/94)
+  rotating `MASTER_SECRET` takes effect on a warm instance, which matters because it is
+  the only kill switch there is. [#95](https://github.com/EnesYilmazcode/relaybee/issues/95)
+  `clientIp` no longer trusts the first `x-forwarded-for` entry, which a caller writes.
+  [#97](https://github.com/EnesYilmazcode/relaybee/issues/97) the unreachable `pro` tier
+  is gone. [#96](https://github.com/EnesYilmazcode/relaybee/issues/96) is largely answered
+  by the queue split: a drive-by mint still works, and it no longer shows anyone anything.
 
 ### Next
 
