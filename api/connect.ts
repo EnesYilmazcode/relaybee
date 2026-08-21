@@ -7,6 +7,7 @@ import { verifyKey, bearer } from '../lib/auth'
 import { seal } from '../lib/seal'
 import { ADAPTERS } from '../lib/providers'
 import { hasSecrets, NOT_CONFIGURED } from '../lib/config'
+import { check, clientIp, rlHeaders } from '../lib/ratelimit'
 
 export const config = { runtime: 'edge' }
 
@@ -16,12 +17,19 @@ const CORS = {
   'access-control-allow-methods': 'POST, OPTIONS',
 }
 
-function json(status: number, obj: unknown) {
+function json(status: number, obj: unknown, extra: Record<string, string> = {}) {
   return new Response(JSON.stringify(obj), {
     status,
-    headers: { 'content-type': 'application/json', ...CORS },
+    headers: { 'content-type': 'application/json', ...CORS, ...extra },
   })
 }
+
+// Sealing runs AES-256-GCM over a body this endpoint never bounded, on the only
+// authenticated route with no meter on it at all. Every other one has both.
+// Sealing is a client-side setup step measured in single digits per user, so the
+// ceiling can be low without any real caller noticing.
+const IP_CONNECT_LIMIT = 20
+const MAX_CONNECT_BYTES = 8 * 1024
 
 export default async function handler(req: Request): Promise<Response> {
   try {
@@ -49,23 +57,40 @@ async function handleConnect(req: Request): Promise<Response> {
     return json(401, { error: { message: 'Missing or invalid Relaybee API key.', type: 'authentication_error' } })
   }
 
+  const rl = check(`connect:${clientIp(req)}`, IP_CONNECT_LIMIT)
+  const rlh = rlHeaders(rl)
+  if (!rl.ok) {
+    return json(429, { error: { message: 'Too many connections sealed from this source. Try again shortly.', type: 'rate_limit_error' } }, rlh)
+  }
+
+  // Bound the body before decoding it, in real bytes rather than JS string
+  // length. A credential plus a label is a few hundred bytes.
+  const raw = await req.arrayBuffer().catch(() => null)
+  if (!raw) return json(400, { error: { message: 'Could not read the request body.' } }, rlh)
+  if (raw.byteLength > MAX_CONNECT_BYTES) {
+    return json(400, { error: { message: `Request body too large: cap is ${MAX_CONNECT_BYTES / 1024}KB.` } }, rlh)
+  }
+
   let payload: { provider?: string; apiKey?: string; api_key?: string; label?: string }
   try {
-    payload = (await req.json()) as typeof payload
+    payload = JSON.parse(new TextDecoder().decode(raw)) as typeof payload
   } catch {
-    return json(400, { error: { message: 'Request body must be valid JSON.' } })
+    return json(400, { error: { message: 'Request body must be valid JSON.' } }, rlh)
   }
 
   const provider = (payload.provider ?? '').toLowerCase()
   const apiKey = payload.apiKey ?? payload.api_key ?? ''
 
-  if (!ADAPTERS[provider]) {
+  // hasOwn, not a truthy index: a plain object answers for "constructor" and
+  // "__proto__" too, so the bare lookup sealed a blob for a provider that does
+  // not exist and reported success for it.
+  if (!Object.hasOwn(ADAPTERS, provider)) {
     return json(400, {
       error: { message: `Unknown provider "${provider}". Supported: ${Object.keys(ADAPTERS).join(', ')}.` },
-    })
+    }, rlh)
   }
   if (!apiKey || apiKey.length < 8) {
-    return json(400, { error: { message: 'Field "apiKey" is required.' } })
+    return json(400, { error: { message: 'Field "apiKey" is required.' } }, rlh)
   }
 
   // The label is echoed back in the x-relaybee-connection-label response header,
@@ -87,5 +112,5 @@ async function handleConnect(req: Request): Promise<Response> {
     label: label || null,
     usage: 'Send this in the X-Relaybee-Connection header. Comma-separate several to pool them.',
     note: 'Bound to your key. Another user replaying this blob gets a decryption failure, not your credits.',
-  })
+  }, rlh)
 }
