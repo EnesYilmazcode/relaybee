@@ -89,6 +89,37 @@ interface Store {
   countPresent(): Promise<number>
 }
 
+type Cmd = (parts: Array<string | number>) => Promise<unknown>
+
+// Upstash caps a single BRPOP at 15 seconds, which is why api/work/next polls
+// for 15 and not 20: a longer window needs a second command to cover the tail,
+// and this blocking read is the only thing the project pays for continuously.
+// One idle supporter is about 6 commands a minute, roughly 259K a month against
+// a 500K free tier.
+const BRPOP_MAX_S = 15
+
+/**
+ * Block on one or more keys until something usable arrives or the deadline passes.
+ *
+ * Both sides of the relay wait this way: a supporter for a job, and a caller for
+ * that job's answer. The loop was written out twice, identically apart from what
+ * it did with the popped value, so the value handling is the parameter and
+ * everything else is here once. Returning null from `take` means "not this one,
+ * keep waiting", which is what lets a stale job be skipped inside the same window.
+ */
+async function brpopUntil<T>(cmd: Cmd, keys: string[], maxWaitMs: number, take: (raw: string) => T | null): Promise<T | null> {
+  const deadline = Date.now() + maxWaitMs
+  for (;;) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return null
+    const timeoutS = Math.max(1, Math.min(BRPOP_MAX_S, Math.ceil(remaining / 1000)))
+    const res = (await cmd(['BRPOP', ...keys, timeoutS])) as [string, string] | null
+    if (!res || !res[1]) continue
+    const taken = take(res[1])
+    if (taken !== null) return taken
+  }
+}
+
 function upstashStore(url: string, token: string): Store {
   const cmd = async (parts: Array<string | number>) => {
     const res = await fetch(url, {
@@ -113,53 +144,31 @@ function upstashStore(url: string, token: string): Store {
     // object. If a supporter popped it a moment ago this removes nothing, which
     // is the correct outcome.
     remove: async (queue, job) => { await cmd(['LREM', queue, 1, JSON.stringify(job)]) },
-    // BRPOP blocks server-side, so an idle poll is one Redis command instead of
-    // ~20 RPOP+sleep round-trips. The 15s cap is why api/work/next polls for 15s
-    // and not 20: a longer window would need a second BRPOP to cover the tail,
-    // and this is the only cost the project pays continuously. With the throttled
-    // heartbeat that is about 6 commands a minute per idle supporter, roughly
-    // 259K a month, against a 500K free tier. Two supporters do not fit.
-    // BRPOP takes several keys and still costs one command, so a node that has
-    // opted into the public pool watches both its own queue and that pool for
-    // the same price as watching one.
-    waitPop: async (queues, maxWaitMs) => {
-      const deadline = Date.now() + maxWaitMs
-      while (true) {
-        const remaining = deadline - Date.now()
-        if (remaining <= 0) return null
-        const timeoutS = Math.max(1, Math.min(15, Math.ceil(remaining / 1000)))
-        const res = (await cmd(['BRPOP', ...queues, timeoutS])) as [string, string] | null
-        if (!res || !res[1]) continue
-        const job = JSON.parse(res[1]) as Job
+    // BRPOP blocks server-side, so an idle poll is one Redis command rather than
+    // ~20 RPOP+sleep round-trips, and it takes several keys for that same one
+    // command: a node that opted into the public pool watches its own queue and
+    // that pool for the price of watching one.
+    waitPop: (queues, maxWaitMs) =>
+      brpopUntil<Job>(cmd, queues, maxWaitMs, (raw) => {
+        const job = JSON.parse(raw) as Job
         // Drop jobs older than the memory store would have trimmed. Without this,
         // a queue that filled while no supporter was online feeds the first node
         // to connect a backlog of prompts whose callers already gave up — real
-        // LLM quota spent answering dead requests. Keep looping within the poll
-        // deadline until a live job or a timeout.
-        if (Date.now() - job.queuedAt > JOB_MAX_AGE_MS) continue
-        return job
-      }
-    },
+        // LLM quota spent answering dead requests. Returning null keeps waiting
+        // within the same deadline rather than handing back a corpse.
+        return Date.now() - job.queuedAt > JOB_MAX_AGE_MS ? null : job
+      }),
     // The answer is a one-element list rather than a plain string so the waiting
     // caller can BRPOP it instead of polling GET twice a second.
     setResult: async (id, result) => {
       await cmd(['LPUSH', `relaybee:result:${id}`, JSON.stringify(result)])
       await cmd(['EXPIRE', `relaybee:result:${id}`, RESULT_TTL_S])
     },
-    // Same trick as waitPop, on the other side of the relay: one blocking command
-    // per 15s of waiting instead of two GETs a second. That is what makes a long
-    // wait affordable, and a long wait is what real answers need.
-    waitResult: async (id, maxWaitMs) => {
-      const key = `relaybee:result:${id}`
-      const deadline = Date.now() + maxWaitMs
-      while (true) {
-        const remaining = deadline - Date.now()
-        if (remaining <= 0) return null
-        const timeoutS = Math.max(1, Math.min(15, Math.ceil(remaining / 1000)))
-        const res = (await cmd(['BRPOP', key, timeoutS])) as [string, string] | null
-        if (res && res[1]) return decodeResult(res[1])
-      }
-    },
+    // The same blocking read on the other side of the relay: one command per 15s
+    // of waiting instead of two GETs a second. That is what makes a long wait
+    // affordable, and a long wait is what real answers need.
+    waitResult: (id, maxWaitMs) =>
+      brpopUntil<Result>(cmd, [`relaybee:result:${id}`], maxWaitMs, decodeResult),
     // One command per poll, and a sweep only on the poll that grows the set.
     // ZADD returns 1 for a member the set did not already have, which is the
     // only way it gets bigger, so this ties the cleanup rate to the mess rate.

@@ -7,7 +7,7 @@
 
 import { bytesToB64u, b64uToBytes, b64uToJson, jsonToB64u, enc } from './b64'
 
-export type KeyPayload = {
+type KeyPayload = {
   u: string // user id
   t: 'free' // tier. There has only ever been one; see LIMITS in ratelimit.ts.
   v: number // key version, for rotation

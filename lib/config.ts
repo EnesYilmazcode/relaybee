@@ -10,7 +10,7 @@
 // It reports only PRESENCE, never the values — nothing here reads, returns, or
 // logs a secret.
 
-export type Secret = 'MASTER_SECRET' | 'MASTER_ENCRYPTION_KEY'
+type Secret = 'MASTER_SECRET' | 'MASTER_ENCRYPTION_KEY'
 
 /** The user-facing message for a missing-secret 503. Says nothing about which. */
 export const NOT_CONFIGURED = 'Relaybee is not configured.'

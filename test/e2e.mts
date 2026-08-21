@@ -10,8 +10,6 @@
 //
 // Uses throwaway secrets and never touches a real provider.
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
 
 process.env.MASTER_SECRET = 'e2e-secret-not-real'
 process.env.MASTER_ENCRYPTION_KEY = Buffer.from(new Uint8Array(32).fill(9)).toString('base64url')
@@ -23,9 +21,10 @@ const workNext = (await import('../api/work/next.ts')).default
 const workComplete = (await import('../api/work/complete.ts')).default
 const workStatus = (await import('../api/work/status.ts')).default
 const health = (await import('../api/health.ts')).default
+const { serveRoutes } = await import('./local-server.mts')
+import type { Routes } from './local-server.mts'
 
-type Handler = (req: Request) => Promise<Response> | Response
-const routes: Record<string, Handler> = {
+const routes: Routes = {
   'POST /api/keys/issue': issue,
   'POST /api/connect': connect,
   'POST /api/v1/chat/completions': chat,
@@ -35,46 +34,10 @@ const routes: Record<string, Handler> = {
   'GET /api/health': health,
 }
 
-// Adapt Node's req/res to the Web Request/Response the handlers speak.
-async function toRequest(req: IncomingMessage, base: string): Promise<Request> {
-  const chunks: Buffer[] = []
-  for await (const c of req) chunks.push(c as Buffer)
-  const body = chunks.length ? Buffer.concat(chunks) : undefined
-  const headers = new Headers()
-  for (const [k, v] of Object.entries(req.headers)) if (typeof v === 'string') headers.set(k, v)
-  return new Request(base + req.url, { method: req.method, headers, body: body as any })
-}
-
-async function writeResponse(res: Response, out: ServerResponse) {
-  out.statusCode = res.status
-  res.headers.forEach((v, k) => out.setHeader(k, v))
-  if (res.body) {
-    const reader = res.body.getReader()
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      out.write(Buffer.from(value))
-    }
-  }
-  out.end()
-}
-
-const server = createServer(async (req, res) => {
-  const base = `http://127.0.0.1:${port}`
-  const url = new URL(base + req.url)
-  const handler = routes[`${req.method} ${url.pathname}`]
-  if (!handler) { res.statusCode = 404; res.end('no route'); return }
-  try {
-    const request = await toRequest(req, base)
-    await writeResponse(await handler(request), res)
-  } catch (e) {
-    res.statusCode = 500
-    res.end(String(e))
-  }
-})
-await new Promise<void>((r) => server.listen(0, r))
-const port = (server.address() as AddressInfo).port
-const BASE = `http://127.0.0.1:${port}`
+// The route table above, served on an ephemeral port. The twenty lines that
+// adapted Node's req/res to a Web Request used to live here, in this file and
+// two others; they live in test/local-server.mts now.
+const { base: BASE, close: closeServer } = await serveRoutes(routes)
 
 let failed = 0
 const t = (name: string, cond: boolean, extra = '') => {
@@ -295,7 +258,7 @@ t('usage is mapped', j3.usage?.total_tokens === 8)
 
 workerOn = false
 await Promise.race([workerTask, new Promise((r) => setTimeout(r, 100))])
-server.close()
+await closeServer()
 
 console.log(failed === 0 ? '\ne2e: all checks passed\n' : `\ne2e: ${failed} check(s) failed\n`)
 process.exit(failed === 0 ? 0 : 1)

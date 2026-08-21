@@ -14,7 +14,7 @@ export type ChatRequest = {
   [k: string]: unknown
 }
 
-export type Adapter = {
+type Adapter = {
   id: string
   endpoint: string
   headers(apiKey: string): Record<string, string>

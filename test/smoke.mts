@@ -1116,5 +1116,102 @@ console.log('%ssse - a CRLF stream is parsed, not silently swallowed', String.fr
   t('and it still terminates properly', out.trimEnd().endsWith('data: [DONE]'))
 }
 
+// Paths that coverage said never ran. Each one is reachable in production, and
+// two of them are whole features, so "untested" was the real finding rather than
+// "dead". The pool-metering branch is the one that mattered most: it was added
+// in this same batch and nothing exercised it.
+console.log('%spaths coverage said never ran', String.fromCharCode(10))
+{
+  const covKey = await issueKey('coverage_probe')
+  const covReq = (body: unknown, extra: Record<string, string> = {}) => new Request('https://x/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${covKey}`, 'x-forwarded-for': '198.18.0.7', ...extra },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  })
+
+  // 1. The relay caps its own message payload at 32KB, separately from the
+  //    256KB body cap, because a job goes into Redis.
+  const bigJob = await chatCompletions(covReq({
+    model: 'claude-code', messages: [{ role: 'user', content: 'x'.repeat(33 * 1024) }],
+  }))
+  const bigJobBody = await bigJob.json()
+  t('a relay job over the 32KB message cap is refused', bigJob.status === 400, `status=${bigJob.status}`)
+  t('and the message says which cap it hit', /relay/i.test(bigJobBody.error.message), bigJobBody.error.message.slice(0, 60))
+
+  // 2. Malformed JSON must be a clean 400, not a thrown parse error.
+  const badJson = await chatCompletions(covReq('{"model": "claude-code", messages'))
+  t('a malformed body is a clean 400', badJson.status === 400, `status=${badJson.status}`)
+
+  // 3. A pooled request is metered per connection. Eight blobs is eight upstream
+  //    calls, and pricing that at one is what made batch key-testing cheap.
+  const poolConns: string[] = []
+  for (let i = 0; i < 6; i++) {
+    poolConns.push(await seal({ provider: 'anthropic', apiKey: `sk-ant-pool-${i}`, owner: 'coverage_probe', createdAt: Date.now(), label: `p${i}` }))
+  }
+  const meterFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response('{"error":{"message":"nope"}}', { status: 401 })) as typeof fetch
+  let sawMeterLimit = false
+  let pooledRequests = 0
+  for (let i = 0; i < 15 && !sawMeterLimit; i++) {
+    const r = await chatCompletions(covReq(
+      { model: 'anthropic/claude-opus-5', messages: [{ role: 'user', content: 'hi' }] },
+      { 'x-relaybee-connection': poolConns.join(',') },
+    ))
+    pooledRequests++
+    if (r.status === 429 && /metered per connection/i.test(await r.text())) sawMeterLimit = true
+  }
+  globalThis.fetch = meterFetch
+  t('a pooled request is metered per connection, not per request', sawMeterLimit,
+    `limit hit after ${pooledRequests} request(s) of 6 connections each`)
+  t('and it took fewer requests than the per-request ceiling would allow',
+    pooledRequests < IP_PROXY_LIMIT, `${pooledRequests} < ${IP_PROXY_LIMIT}`)
+
+  // 4. Streaming through a provider connection. The non-streaming path was
+  //    covered; this whole branch was not.
+  const streamConn = await seal({ provider: 'anthropic', apiKey: 'sk-ant-stream', owner: 'stream_probe', createdAt: Date.now(), label: 'stream' })
+  const streamKey = await issueKey('stream_probe')
+  const anthropicSse = [
+    'event: content_block_delta',
+    'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"stream"}}',
+    '',
+    'event: message_stop',
+    'data: {"type":"message_stop"}',
+    '',
+  ].join(String.fromCharCode(10))
+  const sseFetch = globalThis.fetch
+  globalThis.fetch = (async () => new Response(
+    new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode(anthropicSse)); c.close() } }),
+    { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  )) as typeof fetch
+  const byoStream = await chatCompletions(new Request('https://x/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${streamKey}`, 'x-forwarded-for': '198.18.0.9', 'x-relaybee-connection': streamConn },
+    body: JSON.stringify({ model: 'anthropic/claude-opus-5', stream: true, messages: [{ role: 'user', content: 'go' }] }),
+  }))
+  const byoText = await byoStream.text()
+  globalThis.fetch = sseFetch
+  t('a streamed provider request is SSE, not JSON', byoStream.headers.get('content-type')?.startsWith('text/event-stream') === true,
+    String(byoStream.headers.get('content-type')))
+  t('and its content arrives translated to OpenAI chunks', /"content":"stream"/.test(byoText), byoText.slice(0, 90))
+  t('and it names the provider that served it', byoStream.headers.get('x-relaybee-provider') === 'anthropic')
+
+  // 5. An upstream that cannot be reached at all is a 502 with the pool health
+  //    saying which connection was unreachable, not a thrown fetch error.
+  const deadKey = await issueKey('unreachable_probe')
+  const deadConn = await seal({ provider: 'anthropic', apiKey: 'sk-ant-dead', owner: 'unreachable_probe', createdAt: Date.now(), label: 'dead' })
+  const deadFetch = globalThis.fetch
+  globalThis.fetch = (async () => { throw new Error('ECONNREFUSED') }) as typeof fetch
+  const unreachable = await chatCompletions(new Request('https://x/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${deadKey}`, 'x-forwarded-for': '198.18.0.11', 'x-relaybee-connection': deadConn },
+    body: JSON.stringify({ model: 'anthropic/claude-opus-5', messages: [{ role: 'user', content: 'hi' }] }),
+  }))
+  globalThis.fetch = deadFetch
+  t('an unreachable provider is a 502, not a thrown error', unreachable.status === 502, `status=${unreachable.status}`)
+  t('and the pool health says which connection was unreachable',
+    (unreachable.headers.get('x-relaybee-pool-health') ?? '').includes('unreachable'),
+    String(unreachable.headers.get('x-relaybee-pool-health')))
+}
+
 console.log(failed === 0 ? '\nall checks passed\n' : `\n${failed} check(s) failed\n`)
 process.exit(failed === 0 ? 0 : 1)

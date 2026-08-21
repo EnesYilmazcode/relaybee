@@ -17,8 +17,6 @@
 // says BREACH is a real finding.
 
 import { appendFile, mkdir } from 'node:fs/promises'
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
 
 const argv = new Map<string, string>()
@@ -33,7 +31,8 @@ for (let i = 2; i < process.argv.length; i += 2) argv.set(process.argv[i].replac
 async function bootLocal(): Promise<string> {
   process.env.MASTER_SECRET = 'adversary-suite-secret-not-real'
   process.env.MASTER_ENCRYPTION_KEY = Buffer.from(new Uint8Array(32).fill(23)).toString('base64url')
-  const routes: Record<string, (req: Request) => Promise<Response> | Response> = {
+  const { serveRoutes } = await import('./local-server.mts')
+  const { base } = await serveRoutes({
     'POST /api/keys/issue': (await import('../api/keys/issue.ts')).default,
     'POST /api/connect': (await import('../api/connect.ts')).default,
     'GET /api/v1/models': (await import('../api/v1/models.ts')).default,
@@ -42,32 +41,12 @@ async function bootLocal(): Promise<string> {
     'POST /api/work/complete': (await import('../api/work/complete.ts')).default,
     'GET /api/work/status': (await import('../api/work/status.ts')).default,
     'GET /api/health': (await import('../api/health.ts')).default,
-  }
-  const server = createServer(async (req: IncomingMessage, out: ServerResponse) => {
-    const chunks: Buffer[] = []
-    for await (const c of req) chunks.push(c as Buffer)
-    const headers = new Headers()
-    for (const [k, v] of Object.entries(req.headers)) if (typeof v === 'string') headers.set(k, v)
-    // One source address for the whole run, because "one attacker" is the threat
-    // being modelled and a per-request address would hand them a fresh bucket.
-    if (!headers.has('x-real-ip')) headers.set('x-real-ip', '203.0.113.99')
-    const path = (req.url ?? '/').split('?')[0]
-    const h = routes[`${req.method} ${path}`]
-    if (!h) { out.statusCode = 404; out.setHeader('content-type', 'application/json'); out.end('{}'); return }
-    const res = await h(new Request(`http://127.0.0.1${req.url}`, {
-      method: req.method, headers, body: chunks.length ? (Buffer.concat(chunks) as unknown as BodyInit) : undefined,
-    }))
-    out.statusCode = res.status
-    res.headers.forEach((v, k) => out.setHeader(k, v))
-    if (res.body) {
-      const reader = res.body.getReader()
-      for (;;) { const { done, value } = await reader.read(); if (done) break; out.write(Buffer.from(value)) }
-    }
-    out.end()
+  }, {
+    // One source address for the whole run, because "one attacker" is the
+    // threat being modelled and a per-request address hands them a fresh bucket.
+    defaultHeaders: { 'x-real-ip': '203.0.113.99' },
   })
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
-  server.unref()
-  return `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+  return base
 }
 
 const BASE = (argv.get('base') ?? (await bootLocal())).replace(/\/$/, '')

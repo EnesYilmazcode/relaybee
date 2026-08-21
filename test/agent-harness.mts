@@ -24,7 +24,11 @@
 //                     whatever the supporter answered. This is the mechanics
 //                     check, separate from the willingness check.
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer, type ServerResponse } from 'node:http'
+// The req/res-to-Web-Request adapter used to be copied into this file. It is
+// shared now; this harness still needs its own server callback for the request
+// log, the origin rewriting and the static files, but not its own plumbing.
+import { toRequest, writeResponse } from './local-server.mts'
 import { readFileSync, existsSync } from 'node:fs'
 import type { AddressInfo } from 'node:net'
 
@@ -97,31 +101,6 @@ function publicFile(path: string): { body: string; type: string } | null {
     console.error('refusing to start: rewritten llms.txt still points at production')
     process.exit(1)
   }
-}
-
-// --- plumbing (same shape as test/e2e.mts) -----------------------------------
-
-async function toRequest(req: IncomingMessage, base: string): Promise<Request> {
-  const chunks: Buffer[] = []
-  for await (const c of req) chunks.push(c as Buffer)
-  const body = chunks.length ? Buffer.concat(chunks) : undefined
-  const headers = new Headers()
-  for (const [k, v] of Object.entries(req.headers)) if (typeof v === 'string') headers.set(k, v)
-  return new Request(base + req.url, { method: req.method, headers, body: body as any })
-}
-
-async function writeResponse(res: Response, out: ServerResponse) {
-  out.statusCode = res.status
-  res.headers.forEach((v, k) => out.setHeader(k, v))
-  if (res.body) {
-    const reader = res.body.getReader()
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      out.write(Buffer.from(value))
-    }
-  }
-  out.end()
 }
 
 const json = (out: ServerResponse, status: number, body: unknown) => {
