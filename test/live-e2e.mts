@@ -294,7 +294,8 @@ async function main() {
   if (before.supporters_online === 0) {
     const cold = await complete(alice.key, { model: 'claude-code', messages: [{ role: 'user', content: 'anyone there?' }] })
     ok('an unanswerable request fails fast instead of hanging', cold.status === 504 && cold.totalMs < 25_000, 'status=' + cold.status, cold.totalMs)
-    ok('and it says nobody is online rather than blaming the caller', /no supporter is online/i.test(cold.text), cold.text.slice(0, 90))
+    ok('and it names the real problem rather than blaming the caller', /no node of your own/i.test(cold.text), cold.text.slice(0, 90))
+    ok('and it offers the public pool as the way out', /claude-code[/]public/.test(cold.text))
   } else {
     ok('skipped the cold test, a supporter is already online', true, 'online=' + before.supporters_online)
   }
@@ -305,14 +306,21 @@ async function main() {
   for (let i = 0; i < SUPPORTERS; i++) {
     const k = await mint('supporter' + (i + 1))
     nodeKeys.push(k.key)
-    // --own-traffic-only: this run's callers are this run, so the node is
-    // answering its operator's own questions on its operator's own login. That
-    // is the one shape the API-billing rule does not cover, and it is why the
-    // flag exists rather than the test quietly dropping --bare.
+    // Two flags carry real meaning here, so neither is boilerplate.
+    //
+    // --own-traffic-only: this run's callers are this run, so the node answers
+    // its operator's own questions on its operator's own login. That is the one
+    // shape the API-billing rule does not cover, and it is why the flag exists
+    // rather than the test quietly dropping --bare.
+    //
+    // --pool public: several callers against several nodes is the throughput
+    // shape worth measuring, and the private path pairs exactly one key with
+    // one node by design. So the concurrency run goes through the pool, which
+    // both sides opt into, and the private path is asserted separately below.
     const child = spawn(process.execPath, [
       join(process.cwd(), 'scripts', 'supporter.mjs'),
       '--base', BASE, '--key', k.key, '--label', 'node-' + (i + 1), '--telemetry', EVENTS,
-      '--own-traffic-only', 'true', '--max-jobs', String(JOBS),
+      '--own-traffic-only', 'true', '--pool', 'public', '--max-jobs', String(JOBS + 2),
     ], { stdio: ['ignore', 'pipe', 'pipe'] })
     child.stdout.on('data', (d) => process.stdout.write(dim('  ' + String(d).trimEnd()) + '\n'))
     child.stderr.on('data', (d) => process.stderr.write(red('  ' + String(d).trimEnd()) + '\n'))
@@ -378,7 +386,7 @@ async function main() {
       // streamed one 110s, and real agents do not reliably fit the first.
       const stream = i % 2 === 1
       const key = callerKeys[lane % callerKeys.length]
-      const r = await complete(key, { model: 'claude-code', stream, messages: [{ role: 'user', content: q }] })
+      const r = await complete(key, { model: 'claude-code/public', stream, messages: [{ role: 'user', content: q }] })
       const correct = expect.test(r.text)
       results.push({ i, q, stream, status: r.status, totalMs: r.totalMs, firstByteMs: r.firstByteMs, answer: r.text.slice(0, 120), correct, usage: r.usage })
       await event({ event: 'caller_result', i, stream, status: r.status, totalMs: r.totalMs, firstByteMs: r.firstByteMs, correct, answerChars: r.text.length })
@@ -406,6 +414,23 @@ async function main() {
   const spend = results.reduce((a, r) => a + (r.usage?.cost_usd ?? 0), 0)
   console.log(dim('  reported spend across this run: $' + spend.toFixed(4)))
   summary.reportedSpendUsd = spend
+
+  // The private path is the default and the one that matters, so prove it too:
+  // one caller, one node, the same key, no pool involved.
+  const soloKey = nodeKeys[0]
+  const solo = await complete(soloKey, {
+    model: 'claude-code', stream: true,
+    messages: [{ role: 'user', content: 'What is 6 times 7? Reply with just the number.' }],
+  })
+  ok('a caller reaches its OWN node with no pool involved', /42/.test(solo.text), JSON.stringify(solo.text.slice(0, 40)), solo.totalMs)
+
+  // And the isolation that default buys: a key with no node of its own is told
+  // so rather than being served by somebody else's machine.
+  const outsider = await complete(bob.key, {
+    model: 'claude-code', messages: [{ role: 'user', content: 'can anyone hear me' }],
+  })
+  ok('a caller with no node of its own is not served by another persons node',
+    outsider.status === 504 && /no node of your own/i.test(outsider.text), 'status=' + outsider.status)
 
   summary.results = results
   summary.latency = stats(results.map((r) => r.totalMs))
