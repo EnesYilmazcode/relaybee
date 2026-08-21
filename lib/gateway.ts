@@ -400,6 +400,19 @@ async function chatCompletionsInner(req: Request): Promise<Response> {
     return err(403, `No valid ${adapter.id} connection for this key. Blobs are bound to the user who created them.`, 'permission_error', headers)
   }
 
+  // A pooled request is metered for what it is about to do, not for being one
+  // request. Walking N connections means up to N upstream calls, and pricing
+  // that at 1 turned /api/connect plus the pool walk into a cheap batch oracle
+  // for provider keys: seal 8 candidates, send one request, read each one's real
+  // upstream status out of x-relaybee-pool-health. Failover is untouched for
+  // anyone using it honestly; it just costs what it costs.
+  if (conns.length > 1) {
+    const extra = check(`ip:${clientIp(req)}`, IP_PROXY_LIMIT, conns.length - 1)
+    if (!extra.ok) {
+      return err(429, `Rate limit exceeded for this source. A pooled request is metered per connection, and this one asked for ${conns.length}.`, 'rate_limit_error', headers)
+    }
+  }
+
   // Start at a random offset so load spreads across the pool instead of always
   // hammering whichever connection happens to be first in the header.
   const start = Math.floor(Math.random() * conns.length)

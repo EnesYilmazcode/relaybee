@@ -26,7 +26,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { readFileSync, existsSync } from 'node:fs'
-import { AddressInfo } from 'node:net'
+import type { AddressInfo } from 'node:net'
 
 process.env.MASTER_SECRET = 'agent-harness-secret-not-real'
 process.env.MASTER_ENCRYPTION_KEY = Buffer.from(new Uint8Array(32).fill(7)).toString('base64url')

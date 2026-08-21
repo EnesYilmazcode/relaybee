@@ -9,8 +9,9 @@
     "test": "tsx test/smoke.mts",
     "test:upstash": "tsx test/upstash.mts",
     "test:e2e": "tsx test/e2e.mts",
-    "check": "npm run typecheck && npm test && npm run test:upstash",
-    "test:live": "tsx test/live-e2e.mts"
+    "check": "npm run typecheck && npm test && npm run test:upstash && npm run test:e2e && npm run test:adversary",
+    "test:live": "tsx test/live-e2e.mts",
+    "test:adversary": "tsx test/adversary.mts"
   },
   "devDependencies": {
     "typescript": "^5.6.3",

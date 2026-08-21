@@ -21,7 +21,7 @@ const t = (name: string, cond: boolean, extra = '') => {
 }
 
 console.log('\nauth — keys verify without a datastore')
-const key = await issueKey('enes_abc123', 'free')
+const key = await issueKey('enes_abc123')
 t('issued key carries the rb_live_ prefix', key.startsWith('rb_live_'))
 const payload = await verifyKey(key)
 t('a valid key round-trips its payload', payload?.u === 'enes_abc123' && payload?.t === 'free')
@@ -32,17 +32,29 @@ t('a tampered signature is rejected', (await verifyKey(key.slice(0, -3) + 'xxx')
 t('a forged key is rejected', (await verifyKey('rb_live_nope.nope')) === null)
 t('a missing key is rejected', (await verifyKey(null)) === null)
 
-// tier and user id survive a verify round trip (free is covered above; prove 'pro' too).
-const proKey = await issueKey('enes_pro', 'pro')
-const proPayload = await verifyKey(proKey)
-t('a pro key preserves tier and user id through verify', proPayload?.u === 'enes_pro' && proPayload?.t === 'pro')
+// There has only ever been one tier. This used to mint a 'pro' key and assert it
+// round-tripped, which proved the encoder works and nothing about the product:
+// no code path could issue one, and LIMITS.pro was unreachable.
+const secondKey = await issueKey('enes_second')
+const secondPayload = await verifyKey(secondKey)
+t('a second user id round-trips independently', secondPayload?.u === 'enes_second' && secondPayload?.t === 'free')
+
+// One issued key has exactly one valid spelling. Every variant below decodes to
+// the same payload, so none of them gains anything, but "the key IS the record"
+// only means something if the record has a single form.
+t('a key with junk after a second dot is rejected', (await verifyKey(secondKey + '.trailing')) === null)
+t('a key with padding spliced into the signature is rejected', (await verifyKey(secondKey + '=')) === null)
+t('a key with a non-canonical final character is rejected',
+  (await verifyKey(secondKey.slice(0, -1) + (secondKey.endsWith('A') ? 'B' : 'A'))) === null ||
+  (await verifyKey(secondKey.slice(0, -1) + 'Q')) === null)
+t('the canonical spelling still verifies', (await verifyKey(secondKey))?.u === 'enes_second')
 
 // payload swap: pair one key's body with another key's signature. The HMAC is over
 // the body, so the mismatched signature must fail — you cannot lift a signature onto
-// a different (e.g. tier-escalated) payload.
+// a different payload.
 const freeBody = key.slice('rb_live_'.length).split('.')[0]
-const proSig = proKey.slice('rb_live_'.length).split('.')[1]
-t('a payload-swapped key is rejected', (await verifyKey(`rb_live_${freeBody}.${proSig}`)) === null)
+const otherSig = secondKey.slice('rb_live_'.length).split('.')[1]
+t('a payload-swapped key is rejected', (await verifyKey(`rb_live_${freeBody}.${otherSig}`)) === null)
 
 // junk bearer strings must fall through cleanly, never throw.
 t('an empty string is rejected', (await verifyKey('')) === null)
@@ -180,8 +192,19 @@ t('minting stays open up to the IP ceiling', mintsUnderCeilingOk)
 t('minting past the IP ceiling is refused (429)', mintOverCeiling.status === 429, `status=${mintOverCeiling.status}`)
 
 const ipReq = (h: Record<string, string>) => new Request('https://x/', { headers: h })
-t('clientIp reads x-forwarded-for', clientIp(ipReq({ 'x-forwarded-for': '1.2.3.4, 5.6.7.8' })) === '1.2.3.4')
-t('clientIp falls back to x-real-ip', clientIp(ipReq({ 'x-real-ip': '9.9.9.9' })) === '9.9.9.9')
+// x-forwarded-for is a list the CLIENT can start: send your own and the proxy
+// appends to it, so the first entry is whatever the caller wrote. This used to
+// read that entry, which meant every per-IP limit could be reset by changing one
+// header. Platform-set headers win, and the list fallback reads the hop nearest
+// us rather than the one furthest away.
+t('clientIp prefers the platform header over anything the caller sent',
+  clientIp(ipReq({ 'x-vercel-forwarded-for': '203.0.113.5', 'x-forwarded-for': '1.2.3.4', 'x-real-ip': '9.9.9.9' })) === '203.0.113.5')
+t('clientIp then takes x-real-ip', clientIp(ipReq({ 'x-real-ip': '9.9.9.9', 'x-forwarded-for': '1.2.3.4' })) === '9.9.9.9')
+t('clientIp reads the LAST forwarded-for entry, not the caller-chosen first',
+  clientIp(ipReq({ 'x-forwarded-for': '1.2.3.4, 5.6.7.8' })) === '5.6.7.8')
+t('a spoofed prefix cannot mint a fresh bucket',
+  clientIp(ipReq({ 'x-forwarded-for': 'pretend-im-someone-else, 5.6.7.8' })) ===
+  clientIp(ipReq({ 'x-forwarded-for': 'someone-else-entirely, 5.6.7.8' })))
 t('clientIp degrades safely', clientIp(ipReq({})) === 'unknown')
 
 // The label is echoed into the x-relaybee-connection-label response header, so a
@@ -189,7 +212,7 @@ t('clientIp degrades safely', clientIp(ipReq({})) === 'unknown')
 // api/connect.ts (not an inline copy of the regex): seal a dirty label through
 // the handler, then decrypt the returned blob and assert it came out printable.
 const connectForLabel = (await import('../api/connect.ts')).default
-const labelKey = await issueKey('label_user', 'free')
+const labelKey = await issueKey('label_user')
 const dirtyLabelRes = await connectForLabel(new Request('https://x/api/connect', {
   method: 'POST',
   headers: { authorization: `Bearer ${labelKey}`, 'content-type': 'application/json' },
@@ -204,7 +227,7 @@ t('the connect response never reflects a raw CRLF label', !/[\r\n]/.test(dirtyLa
 
 console.log('\npool health — failover surfaces per-connection outcomes')
 const { chatCompletions } = await import('../lib/gateway.ts')
-const healthKey = await issueKey('health_user', 'free')
+const healthKey = await issueKey('health_user')
 const connA = await seal({ provider: 'anthropic', apiKey: 'sk-ant-aaaaaaaa', owner: 'health_user', createdAt: Date.now(), label: 'first' })
 const connB = await seal({ provider: 'anthropic', apiKey: 'sk-ant-bbbbbbbb', owner: 'health_user', createdAt: Date.now(), label: 'second' })
 
@@ -259,13 +282,13 @@ t('the old header name is still allowed through preflight', (legacyHeaderRes.hea
 console.log('\nsupporter relay — claude-code jobs round-trip through the queue')
 const workNext = (await import('../api/work/next.ts')).default
 const workComplete = (await import('../api/work/complete.ts')).default
-const userKey = await issueKey('relay_user', 'free')
+const userKey = await issueKey('relay_user')
 // The SAME user id, a different key string: one person's app calling, and that
 // same person's machine answering. That pairing is the whole access control now.
 // A job goes to its requester's own queue, so a node holding a key for anyone
 // else simply never sees it.
-const supporterKey = await issueKey('relay_user', 'free')
-const strangerKey = await issueKey('some_stranger', 'free')
+const supporterKey = await issueKey('relay_user')
+const strangerKey = await issueKey('some_stranger')
 
 const relayReq = (body: unknown) => new Request('https://x/api/v1/chat/completions', {
   method: 'POST',
@@ -376,7 +399,8 @@ t('stream:true yields SSE with the answer', sseText.includes('echo:ping-sse') &&
 console.log('\nsupporter presence — the site can tell when a node is live')
 const workStatus = (await import('../api/work/status.ts')).default
 const statusReq = (key: string) => new Request('https://x/api/work/status', { headers: { authorization: `Bearer ${key}` } })
-const presenceUser = await issueKey('presence_user', 'free')
+const PRESENCE_USER = 'presence_user'
+const presenceUser = await issueKey(PRESENCE_USER)
 
 const before = await (await workStatus(statusReq(presenceUser))).json()
 t('a node that never polled reads offline', before.connected === false)
@@ -384,13 +408,16 @@ t('a node that never polled reads offline', before.connected === false)
 // A poll marks the node live before it even returns work. Give it a job to pop
 // so the long-poll returns immediately instead of holding the full window.
 const { submitJob } = await import('../lib/queue.ts')
-await submitJob('claude-code', [{ role: 'user', content: 'warm' }])
+// Queued under the same user the polling key names, because a node only ever
+// sees its own queue now.
+await submitJob('claude-code', [{ role: 'user', content: 'warm' }], PRESENCE_USER)
 await workNext(new Request('https://x/api/work/next', { method: 'POST', headers: { authorization: `Bearer ${presenceUser}` } }))
 const after = await (await workStatus(statusReq(presenceUser))).json()
 t('polling marks the node connected', after.connected === true)
 
 // Presence is scoped to the key — a different user never sees this node.
-const otherKey = await issueKey('someone_else', 'free')
+const OTHER_USER = 'someone_else'
+const otherKey = await issueKey(OTHER_USER)
 const otherRes = await workStatus(statusReq(otherKey))
 const other = await otherRes.json()
 t('presence does not leak across keys', other.connected === false)
@@ -404,13 +431,13 @@ t('status is never shared-cached', /private/.test(statusCache) && /no-store/.tes
 t('status reports a global online count', typeof other.online === 'number' && other.online >= 1)
 const { countLive } = await import('../lib/queue.ts')
 const baseline = await countLive()
-await submitJob('claude-code', [{ role: 'user', content: 'warm2' }])
+await submitJob('claude-code', [{ role: 'user', content: 'warm2' }], OTHER_USER)
 await workNext(new Request('https://x/api/work/next', { method: 'POST', headers: { authorization: `Bearer ${otherKey}` } }))
 t('a second live node raises the count', (await countLive()) >= baseline + 1)
 
 console.log('\nwork endpoints — consistent rate-limit headers and CORS exposure')
 const rlUser = 'rl_headers_user'
-const rlKey = await issueKey(rlUser, 'free')
+const rlKey = await issueKey(rlUser)
 const hasRl = (r: Response) =>
   r.headers.get('x-ratelimit-limit') !== null &&
   r.headers.get('x-ratelimit-remaining') !== null &&
@@ -584,7 +611,7 @@ const gUpstream = new ReadableStream<Uint8Array>({ start(c) { c.close() } })
 t('groq stream is a passthrough too', ADAPTERS.groq.translateStream(gUpstream, 'groq/llama-3.3-70b-versatile') === gUpstream)
 console.log('\nbody size cap — oversized proxy requests are rejected before any upstream call')
 const { MAX_BODY_BYTES } = await import('../lib/gateway.ts')
-const capKey = await issueKey('cap_user', 'free')
+const capKey = await issueKey('cap_user')
 const capConn = await seal({ provider: 'anthropic', apiKey: 'sk-ant-cccccccc', owner: 'cap_user', createdAt: Date.now(), label: 'cap' })
 
 // A body just over the cap must 400 before the pool is even opened. Guard the
@@ -973,6 +1000,7 @@ console.log('%srelay timeout copy - the message names the real problem', String.
     res.status === 504 && /no node of your own/i.test(body.error.message), body.error.message.slice(0, 60))
   t('and is pointed at the public pool as the alternative', /claude-code[/]public/.test(body.error.message))
 
+}
 // GET /api/v1/models feeds model pickers, so every id it hands out has to be one
 // the router will actually accept. It used to list provider names, which are the
 // one thing routing rejects: "anthropic" alone is a 400, "anthropic/<model>" is not.
@@ -993,6 +1021,7 @@ console.log('\nmodels - every advertised id is one the router accepts')
   t('a bare provider name is NOT advertised as a model', !body.data.some((m) => m.id in ADAPTERS))
   t('the providers are still reported, separately', body.providers.length === Object.keys(ADAPTERS).length)
 
+}
 // The filenames under public/ carry no content hash, so a long immutable cache
 // pins a returning visitor to whatever app.js they first loaded. Every frontend
 // fix, security ones included, then has no way to reach them: the HTML updates,
@@ -1015,6 +1044,7 @@ console.log('%sno unversioned asset is cached immutably', String.fromCharCode(10
     caches.map((c) => c.source).join(' '),
   )
 
+}
 // Three limits that did not measure what their names claimed.
 console.log('%slimits - the caps count what they say they count', String.fromCharCode(10))
 {
@@ -1055,6 +1085,7 @@ console.log('%slimits - the caps count what they say they count', String.fromCha
     method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${limitKey}` }, body: cjkBody,
   }))
   t('and it is refused on bytes, not characters', cjkRes.status === 400, `status=${cjkRes.status}`)
+}
 
 // The job trim decides a caller has given up. It has to outlast the longest
 // wait a caller can legitimately still be in, or a supporter freeing up inside

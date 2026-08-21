@@ -141,7 +141,7 @@ const pollReq = (k: string) => new Request('https://x/api/work/next', {
 // The node polls its OWN queue, so the job has to be queued under the same user
 // the key names. Under the old global list any user id would have done.
 const BEAT_USER = 'beat_user'
-const beatKey = await issueKey(BEAT_USER, 'free')
+const beatKey = await issueKey(BEAT_USER)
 // Queue a job before each poll so BRPOP returns at once instead of blocking.
 await queue.submitJob('claude-code', [{ role: 'user', content: 'beat one' }], BEAT_USER)
 fake.reset()
@@ -153,7 +153,7 @@ t('an immediate second poll does not pay for it again', (fake.counts.get('ZADD')
 t('the second poll still returned its job', true)
 
 console.log('\nupstash — a backend outage degrades cleanly (the #55 guard, now covered)')
-const key = await issueKey('outage_user', 'free')
+const key = await issueKey('outage_user')
 fake.failNext(20)
 const outage = await workNext(new Request('https://x/api/work/next', {
   method: 'POST', headers: { authorization: `Bearer ${key}` },

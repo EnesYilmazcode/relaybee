@@ -1,7 +1,7 @@
 // The attack suite. It mints its own keys and tries to break in.
 //
-//   npx tsx test/adversary.mts                       # against production
-//   npx tsx test/adversary.mts --base http://...     # against a preview or local
+//   npm run test:adversary                           # boots its own server
+//   npx tsx test/adversary.mts --base https://...    # against a real deployment
 //
 // Nothing here needs a human, an operator, or a credential from anywhere. That
 // is the whole point: /api/keys/issue is unauthenticated and free, so a stranger
@@ -17,12 +17,60 @@
 // says BREACH is a real finding.
 
 import { appendFile, mkdir } from 'node:fs/promises'
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
 
 const argv = new Map<string, string>()
 for (let i = 2; i < process.argv.length; i += 2) argv.set(process.argv[i].replace(/^--/, ''), process.argv[i + 1])
 
-const BASE = (argv.get('base') ?? 'https://relaybee.vercel.app').replace(/\/$/, '')
+/**
+ * With no --base this boots the real edge handlers on an ephemeral port and
+ * attacks those. That is deliberate: an attack suite that needs a deployment, a
+ * credential, or an operator is one that does not run, and this one has to run
+ * on every push. It makes no model calls and needs no secrets, so it is free.
+ */
+async function bootLocal(): Promise<string> {
+  process.env.MASTER_SECRET = 'adversary-suite-secret-not-real'
+  process.env.MASTER_ENCRYPTION_KEY = Buffer.from(new Uint8Array(32).fill(23)).toString('base64url')
+  const routes: Record<string, (req: Request) => Promise<Response> | Response> = {
+    'POST /api/keys/issue': (await import('../api/keys/issue.ts')).default,
+    'POST /api/connect': (await import('../api/connect.ts')).default,
+    'GET /api/v1/models': (await import('../api/v1/models.ts')).default,
+    'POST /api/v1/chat/completions': (await import('../api/v1/chat/completions.ts')).default,
+    'POST /api/work/next': (await import('../api/work/next.ts')).default,
+    'POST /api/work/complete': (await import('../api/work/complete.ts')).default,
+    'GET /api/work/status': (await import('../api/work/status.ts')).default,
+    'GET /api/health': (await import('../api/health.ts')).default,
+  }
+  const server = createServer(async (req: IncomingMessage, out: ServerResponse) => {
+    const chunks: Buffer[] = []
+    for await (const c of req) chunks.push(c as Buffer)
+    const headers = new Headers()
+    for (const [k, v] of Object.entries(req.headers)) if (typeof v === 'string') headers.set(k, v)
+    // One source address for the whole run, because "one attacker" is the threat
+    // being modelled and a per-request address would hand them a fresh bucket.
+    if (!headers.has('x-real-ip')) headers.set('x-real-ip', '203.0.113.99')
+    const path = (req.url ?? '/').split('?')[0]
+    const h = routes[`${req.method} ${path}`]
+    if (!h) { out.statusCode = 404; out.setHeader('content-type', 'application/json'); out.end('{}'); return }
+    const res = await h(new Request(`http://127.0.0.1${req.url}`, {
+      method: req.method, headers, body: chunks.length ? (Buffer.concat(chunks) as unknown as BodyInit) : undefined,
+    }))
+    out.statusCode = res.status
+    res.headers.forEach((v, k) => out.setHeader(k, v))
+    if (res.body) {
+      const reader = res.body.getReader()
+      for (;;) { const { done, value } = await reader.read(); if (done) break; out.write(Buffer.from(value)) }
+    }
+    out.end()
+  })
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+  server.unref()
+  return `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+}
+
+const BASE = (argv.get('base') ?? (await bootLocal())).replace(/\/$/, '')
 const OUT = argv.get('out') ?? join(process.cwd(), 'telemetry')
 
 const started = Date.now()
@@ -200,17 +248,21 @@ async function main() {
 
   // --- 6. is anything unmetered? -------------------------------------------
   section('Attack 6: find an endpoint with no meter on it')
+  // Before the burst: a 429 from an exhausted bucket would pass this for the
+  // wrong reason, and a check that cannot fail is not a check.
+  const proto = await post('/api/connect', { provider: 'constructor', api_key: 'sk-ant-proto-probe' }, attacker.key)
+  held('a prototype key is not accepted as a provider', proto.status === 400, 'status=' + proto.status)
+  const dunder = await post('/api/connect', { provider: '__proto__', api_key: 'sk-ant-proto-probe' }, attacker.key)
+  held('and neither is __proto__', dunder.status === 400, 'status=' + dunder.status)
+
   let sealLimited = false
   let sealCalls = 0
-  for (let i = 0; i < 40 && !sealLimited; i++) {
+  for (let i = 0; i < 60 && !sealLimited; i++) {
     const r = await post('/api/connect', { provider: 'anthropic', api_key: 'sk-ant-burst-' + i }, attacker.key)
     sealCalls++
     if (r.status === 429) sealLimited = true
   }
   held('sealing connections is rate limited', sealLimited, 'limited after ' + sealCalls + ' call(s)')
-
-  const proto = await post('/api/connect', { provider: 'constructor', api_key: 'sk-ant-proto-probe' }, attacker.key)
-  held('a prototype key is not accepted as a provider', proto.status === 400 || proto.status === 429, 'status=' + proto.status)
 
   // --- report ---------------------------------------------------------------
   stop.done = true
