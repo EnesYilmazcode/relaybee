@@ -11,7 +11,7 @@
 // Uses throwaway secrets and never touches a real provider.
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { AddressInfo } from 'node:net'
+import type { AddressInfo } from 'node:net'
 
 process.env.MASTER_SECRET = 'e2e-secret-not-real'
 process.env.MASTER_ENCRYPTION_KEY = Buffer.from(new Uint8Array(32).fill(9)).toString('base64url')

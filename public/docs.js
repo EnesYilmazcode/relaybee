@@ -141,7 +141,7 @@ $('btn-mint').addEventListener('click', async (e) => {
 // --- supporter presence ----------------------------------------------------
 
 // Ten seconds, and stopped while the tab is hidden, for the same reason the home
-// page does it: each poll is three Upstash commands against a 500K monthly budget
+// page does it: each poll is two Upstash commands against a 500K monthly budget
 // and presence has a 45s server-side TTL, so faster buys no accuracy.
 const STATUS_POLL_MS = 10_000
 let statusTimer = null
