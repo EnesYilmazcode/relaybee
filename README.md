@@ -186,7 +186,7 @@ For a fuller tour of the design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md
 | POST | `/api/keys/issue` | Make a Relaybee key |
 | POST | `/api/connect` | Seal a provider key into a blob you keep |
 | POST | `/api/v1/chat/completions` | The proxy, OpenAI compatible, streaming supported |
-| GET | `/api/v1/models` | List providers |
+| GET | `/api/v1/models` | List callable models, and the providers you can route to |
 | POST | `/api/work/next` | Supporter: ask for the next job |
 | POST | `/api/work/complete` | Supporter: send back an answer |
 | GET | `/api/work/status` | Is a supporter online, and how many |

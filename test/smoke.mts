@@ -968,6 +968,26 @@ console.log('%srelay timeout copy - the message names the real problem', String.
   t('a caller with no node of their own is told exactly that',
     res.status === 504 && /no node of your own/i.test(body.error.message), body.error.message.slice(0, 60))
   t('and is pointed at the public pool as the alternative', /claude-code[/]public/.test(body.error.message))
+
+// GET /api/v1/models feeds model pickers, so every id it hands out has to be one
+// the router will actually accept. It used to list provider names, which are the
+// one thing routing rejects: "anthropic" alone is a 400, "anthropic/<model>" is not.
+console.log('\nmodels - every advertised id is one the router accepts')
+{
+  const listKey = await issueKey('models_probe')
+  const res = await (await import('../api/v1/models.ts')).default(
+    new Request('https://relaybee.test/api/v1/models', { headers: { authorization: `Bearer ${listKey}` } }),
+  )
+  const body = (await res.json()) as { data: Array<{ id: string; object: string }>; providers: Array<{ id: string }> }
+  t('the list is not empty', body.data.length > 0, `${body.data.length}`)
+  t('every entry is typed as a model', body.data.every((m) => m.object === 'model'))
+  t(
+    'every advertised id routes or is the relay model',
+    body.data.every((m) => m.id === 'claude-code' || Boolean(route(m.id))),
+    body.data.map((m) => m.id).join(', '),
+  )
+  t('a bare provider name is NOT advertised as a model', !body.data.some((m) => m.id in ADAPTERS))
+  t('the providers are still reported, separately', body.providers.length === Object.keys(ADAPTERS).length)
 }
 
 console.log(failed === 0 ? '\nall checks passed\n' : `\n${failed} check(s) failed\n`)

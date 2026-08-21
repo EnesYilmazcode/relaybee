@@ -238,7 +238,7 @@ curl.exe __ORIGIN__/api/v1/chat/completions `
   </table>
   <p class="hint">The part after the slash is passed to the provider untouched, so
   <code>anthropic/claude-opus-5</code> and <code>groq/llama-3.3-70b-versatile</code> both work.
-  <code>GET /api/v1/models</code> lists the providers.</p>
+  <code>GET /api/v1/models</code> lists the models you can call without bringing anything, and the providers you can route to if you do.</p>
 
   <h2>When it does not work</h2>
   <table>
@@ -263,7 +263,7 @@ curl.exe __ORIGIN__/api/v1/chat/completions `
       <tr><td><code>POST /api/keys/issue</code></td><td>Mint a key. No auth, 10 per minute per source.</td></tr>
       <tr><td><code>POST /api/connect</code></td><td>Seal a provider key into a blob you keep.</td></tr>
       <tr><td><code>POST /api/v1/chat/completions</code></td><td>The one that answers questions.</td></tr>
-      <tr><td><code>GET /api/v1/models</code></td><td>List providers.</td></tr>
+      <tr><td><code>GET /api/v1/models</code></td><td>List callable models, and the providers you can route to.</td></tr>
       <tr><td><code>GET /api/work/status</code></td><td>How many supporters are online, and whether one of them is yours.</td></tr>
       <tr><td><code>GET /api/health</code></td><td>Liveness, queue backend, deployed commit.</td></tr>
     </tbody>
