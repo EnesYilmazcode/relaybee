@@ -8,7 +8,7 @@
 import { verifyKey, bearer } from './auth'
 import { open, type Connection } from './seal'
 import { route, ADAPTERS, type ChatRequest } from './providers'
-import { check, LIMITS, clientIp, IP_PROXY_LIMIT, rlHeaders } from './ratelimit'
+import { check, LIMITS, clientIp, IP_PROXY_LIMIT, PUBLIC_POOL_LIMIT, rlHeaders } from './ratelimit'
 import { submitJob, awaitResult, cancelJob, countLivePublic, isLive, type Job, type Usage, type Pool } from './queue'
 import { hasSecrets, NOT_CONFIGURED } from './config'
 
@@ -177,8 +177,27 @@ function flatten(content: unknown): string {
   return ''
 }
 
-async function relayCompletion(body: ChatRequest, owner: string, headers: Record<string, string>): Promise<Response> {
+async function relayCompletion(req: Request, body: ChatRequest, owner: string, headers: Record<string, string>): Promise<Response> {
   const pool = poolFor(body.model)
+  // A public-pool job is answered on a volunteer's own API key, so it spends a
+  // budget the caller does not hold and Relaybee cannot see. The general limit
+  // is the wrong instrument for that: it exists to protect this service's
+  // invocation quota. Metered on the key and on the source, because minting a
+  // fresh key is free and unauthenticated, so a key-only bucket is one request
+  // away from being reset. Charged before the job is queued, so a refused
+  // caller costs no Redis command and no supporter's attention.
+  if (pool === 'public') {
+    const perKey = check(`public:${owner}`, PUBLIC_POOL_LIMIT)
+    const perIp = check(`public-ip:${clientIp(req)}`, PUBLIC_POOL_LIMIT)
+    if (!perKey.ok || !perIp.ok) {
+      return err(
+        429,
+        `Too many jobs for the public pool. It is answered on a volunteer's own API key, so it is capped at ${PUBLIC_POOL_LIMIT} a minute per caller. Send "${RELAY_PROVIDER}" to reach a node of your own instead, which is metered against your own quota.`,
+        'rate_limit_error',
+        { ...headers, ...rlHeaders(perKey.ok ? perIp : perKey) },
+      )
+    }
+  }
   // Message elements are unknown-typed from the wire; a null or non-object entry
   // would throw on property access, so coerce defensively rather than trust them.
   const messages: Job['messages'] = body.messages.map((m) => ({
@@ -389,7 +408,7 @@ async function chatCompletionsInner(req: Request): Promise<Response> {
   }
 
   if (body.model === RELAY_PROVIDER || body.model.startsWith(`${RELAY_PROVIDER}/`)) {
-    return relayCompletion(body, auth.u, headers)
+    return relayCompletion(req, body, auth.u, headers)
   }
 
   const routed = route(body.model)
