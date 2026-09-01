@@ -95,8 +95,12 @@ const post = (path: string, body: unknown, key?: string) =>
 /**
  * A minimal honest node for the victim: poll, answer with a fixed string,
  * deliver. No model, so this suite is free to run and safe in CI.
+ *
+ * It keeps the tickets it was issued, because the ticket forgery below has to be
+ * the same length as a real one or the length guard in checkTicket refuses it
+ * before the constant-time compare ever runs.
  */
-function victimNode(key: string, stop: { done: boolean }, seen: string[]) {
+function victimNode(key: string, stop: { done: boolean }, seen: string[], tickets: string[]) {
   return (async () => {
     while (!stop.done) {
       let res: Response
@@ -106,6 +110,7 @@ function victimNode(key: string, stop: { done: boolean }, seen: string[]) {
       if (res.status !== 200) continue
       const job = (await res.json()) as { id: string; ticket: string; messages: Array<{ content: string }> }
       seen.push(job.messages.at(-1)?.content ?? '')
+      tickets.push(job.ticket)
       await post('/api/work/complete', { id: job.id, ticket: job.ticket, text: 'ANSWERED_BY_THE_VICTIMS_OWN_NODE' }, key)
     }
   })()
@@ -119,16 +124,27 @@ async function main() {
   section('Getting in the door')
   const t0 = Date.now()
   const attacker = await mint('attacker')
-  held('minting a key needs no account, which is the attacker\'s starting position',
-    true, 'got ' + attacker.user_id + ' in ' + (Date.now() - t0) + 'ms')
   const victim = await mint('victim')
   const victimNodeKey = victim.key // the same key: that pairing is the access control
+
+  // A control, not a defence, so it aborts the run rather than counting itself
+  // among the checks that held. Every refusal below is only meaningful while the
+  // attacker is holding a key that actually authenticates: a suite whose
+  // attacker cannot get in anywhere would report a clean sweep having tested
+  // nothing, and this line used to be a literal `true` that could not say so.
+  const attackerAuth = await fetch(BASE + '/api/v1/models', { headers: auth(attacker.key) })
+  if (attackerAuth.status !== 200) {
+    throw new Error(`the attacker's minted key does not authenticate (status ${attackerAuth.status}), so nothing below would be testing anything`)
+  }
+  console.log(dim('control  minting needs no account: ' + attacker.user_id +
+    ' in ' + (Date.now() - t0) + 'ms, and the key works'))
 
   // --- 1. can a stranger read someone else's prompts? ----------------------
   section('Attack 1: drain the queue and read a stranger\'s prompt')
   const stop = { done: false }
   const seen: string[] = []
-  const node = victimNode(victimNodeKey, stop, seen)
+  const tickets: string[] = []
+  const node = victimNode(victimNodeKey, stop, seen, tickets)
 
   // Let the node get its first poll in before the victim calls.
   await new Promise((r) => setTimeout(r, 1200))
@@ -167,11 +183,25 @@ async function main() {
   held('the job id really is exposed to anyone who can see a response',
     /^[0-9a-f-]{36}$/.test(leakedId), leakedId || '(none)')
 
+  // Any non-200 used to pass this, which included a 429 from an exhausted bucket
+  // and a 503 from a queue that was simply down. A missing ticket is a 400, and
+  // that is the status that means the endpoint looked and refused.
   const injectNoTicket = await post('/api/work/complete', { id: leakedId, text: 'INJECTED' }, attacker.key)
-  held('completing with just the leaked id is refused', injectNoTicket.status !== 200, 'status=' + injectNoTicket.status)
+  held('completing with just the leaked id is refused as a missing ticket',
+    injectNoTicket.status === 400, 'status=' + injectNoTicket.status)
 
-  const injectFakeTicket = await post('/api/work/complete', { id: leakedId, ticket: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', text: 'INJECTED' }, attacker.key)
-  held('completing with an invented ticket is refused', injectFakeTicket.status === 403, 'status=' + injectFakeTicket.status)
+  // checkTicket compares lengths before it compares bytes, and the forgery here
+  // used to be 42 characters against a real 43, so the length guard threw it out
+  // and the constant-time compare underneath was never exercised at all. Build
+  // one from a real ticket so it is the right length and every byte is wrong.
+  const realTicket = tickets[0] ?? ''
+  const forgedTicket = realTicket
+    ? [...realTicket].map((c) => (c === 'A' ? 'B' : 'A')).join('')
+    : 'A'.repeat(43)
+  const injectFakeTicket = await post('/api/work/complete', { id: leakedId, ticket: forgedTicket, text: 'INJECTED' }, attacker.key)
+  held('an invented ticket of the right length is refused by the compare, not the length guard',
+    injectFakeTicket.status === 403 && realTicket.length > 0 && forgedTicket.length === realTicket.length,
+    'status=' + injectFakeTicket.status + ', forged ' + forgedTicket.length + ' vs real ' + realTicket.length + ' chars')
 
   stop.done = true
 
@@ -182,7 +212,25 @@ async function main() {
     const r = await fetch(BASE + '/api/v1/models', { headers: auth(key) })
     held(name, r.status === want, 'status=' + r.status)
   }
-  await probe('a flipped signature byte', 'rb_live_' + body + '.' + sig.slice(0, -1) + (sig.slice(-1) === 'A' ? 'B' : 'A'))
+  // Flip a character at the FRONT of the signature: every character there
+  // contributes six significant bits, so this is always a different signature.
+  await probe('a flipped signature byte', 'rb_live_' + body + '.' + (sig[0] === 'A' ? 'B' : 'A') + sig.slice(1))
+  // The last character is the interesting one and it has to be computed. A
+  // 32-byte signature is 43 base64url characters, so the final one carries four
+  // significant bits and two spare, and its alphabet index is always a multiple
+  // of four: only the three characters above it in that group decode to the same
+  // bytes. Those are the spellings the HMAC cannot tell apart, and the canonical
+  // check in lib/auth.ts is the only thing rejecting them. Guessing a letter
+  // usually lands in another group, where the HMAC does the work and this passes
+  // while testing nothing.
+  const B64U = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+  const last = B64U.indexOf(sig.slice(-1))
+  const group = last - (last % 4)
+  for (const n of [group, group + 1, group + 2, group + 3]) {
+    if (n === last) continue
+    await probe('a non-canonical spelling of the same signature (' + B64U[n] + ')',
+      'rb_live_' + body + '.' + sig.slice(0, -1) + B64U[n])
+  }
   await probe('the signature removed entirely', 'rb_live_' + body)
   await probe('another user\'s payload under this signature', 'rb_live_' + attacker.key.slice('rb_live_'.length).split('.')[0] + '.' + sig)
   await probe('a payload edited to claim the pro tier',

@@ -133,6 +133,28 @@ t('and it removed the node that was past its TTL', (await fake.raw(['ZSCORE', 'r
 t('so the set holds the live nodes and nothing else',
   (await fake.raw(['ZCARD', 'relaybee:nodes'])) === liveBefore + 1, String(await fake.raw(['ZCARD', 'relaybee:nodes'])))
 
+console.log('\nupstash — presence is per pool, because that is what a "/public" caller depends on')
+// Every node marks itself live whether or not it opted into the shared pool,
+// so the global number cannot answer "is anyone watching the queue MY job went
+// into". A second, opt-in set can, and an own-only node must not appear in it.
+// Warm the member first: the beat that ADDS a node also sweeps, so measuring a
+// first beat would measure the sweep and not the opt-in.
+await queue.markLive('own-only-node')
+fake.reset()
+await queue.markLive('own-only-node')
+t('a repeat own-only beat still costs exactly one command', fake.total() === 1,
+  `${fake.total()} commands: ${[...fake.counts].map(([k, v]) => k + '=' + v).join(' ')}`)
+t('and an own-only node is not counted as watching the public pool',
+  (await queue.countLivePublic()) === 0, String(await queue.countLivePublic()))
+fake.reset()
+await queue.markLive('public-node', true)
+t('a node that opted in is counted in the public pool',
+  (await queue.countLivePublic()) === 1, String(await queue.countLivePublic()))
+t('and it still shows up in the global number the site displays',
+  (await queue.isLive('public-node')) === true)
+t('opting in costs one extra write, paid only by the nodes that opt in',
+  (fake.counts.get('ZADD') ?? 0) === 2, String(fake.counts.get('ZADD')))
+
 console.log('\nupstash — the presence heartbeat is throttled, not per poll')
 const workNext = (await import('../api/work/next.ts')).default
 const pollReq = (k: string) => new Request('https://x/api/work/next', {
@@ -148,9 +170,9 @@ fake.reset()
 await workNext(pollReq(beatKey))
 t('a first poll marks presence', (fake.counts.get('ZADD') ?? 0) === 1, String(fake.counts.get('ZADD')))
 await queue.submitJob('claude-code', [{ role: 'user', content: 'beat two' }], BEAT_USER)
-await workNext(pollReq(beatKey))
+const secondPoll = await workNext(pollReq(beatKey))
 t('an immediate second poll does not pay for it again', (fake.counts.get('ZADD') ?? 0) === 1, String(fake.counts.get('ZADD')))
-t('the second poll still returned its job', true)
+t('the second poll still returned its job', secondPoll.status === 200, String(secondPoll.status))
 
 console.log('\nupstash — a backend outage degrades cleanly (the #55 guard, now covered)')
 const key = await issueKey('outage_user')

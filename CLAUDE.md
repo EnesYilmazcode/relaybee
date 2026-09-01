@@ -3,8 +3,11 @@
 Relaybee is one OpenAI-shaped endpoint with two ways to get an answer:
 1. **Bring your own keys** — route to Anthropic / OpenAI / Groq with credentials the caller
    supplies, sealed into client-held blobs, pooled with failover.
-2. **Supporter relay** — call the `claude-code` model and a supporter's machine (running a
-   pasted worker loop) answers it. No provider key needed on the caller's side.
+2. **Supporter relay** — `claude-code` reaches supporter nodes running under the caller's own key
+   (a pasted worker loop), so the job is only ever offered to their own machines.
+   `claude-code/public` is the opt-in escape hatch that offers it to anyone who has opted a node
+   into the shared pool, which is how a stranger's machine answers. No provider key needed on the
+   caller's side either way.
 
 The homepage (`public/index.html` + `app.css` + `app.js`) auto-mints a key on load, offers a
 copy/regenerate box, a supporter toggle with a live "N supporters online" count, and a worker
@@ -20,18 +23,27 @@ path through the API and is documented on the docs page; it just has no UI.
   connections are AES-256-GCM blobs the client holds (`lib/seal.ts`). Verification is a recompute,
   not a lookup. The relay queue (`lib/queue.ts`) uses Upstash Redis when `UPSTASH_REDIS_REST_*`
   are set and a per-instance in-memory fallback otherwise — that is the only stateful piece.
+- **Delivery is gated on a ticket, not on the job id.** `/api/work/complete` requires the HMAC over
+  (jobId, poppingNodeUserId) that `/api/work/next` issued with the job, recomputed on the way in.
+  The id alone is not a capability: the gateway hands it back to the caller as `chatcmpl-<id>`, so
+  it leaks by design.
+- **Presence is per pool.** A node opts in by posting `{"pool":"public"}` to `/api/work/next`,
+  `markLive(userId, watchesPublic)` records that in a second sorted set, and `lib/gateway.ts` reads
+  `countLivePublic()` for a "/public" caller. Its fate depends on the opt-in count, not the global
+  one, which would otherwise hold it on the strength of an unrelated own-only node.
 - **Connection blobs are bound to their owner** as AES-GCM additional data. A blob is unusable by
   anyone but the user who sealed it. This is deliberate and security-reviewed; never remove it.
 - **Zero runtime dependencies, Edge runtime, WebCrypto only.** No npm packages in `lib/` or `api/`.
 - **Strict CSP on every HTML page** (no inline script/style, same-origin only). A bearer key in
   localStorage means any XSS is key theft. Keep JS/CSS in external files.
-- **The relay is a disclosed plaintext-trust relationship.** Supporters see prompts, users see
-  answers, and the two risks a supporter carries are that the prompt is untrusted input reaching
-  their agent and that a consumer subscription is licensed to its holder. The full disclosure lives
-  in `public/llms.txt`, which is the file the connect line makes an agent read before it runs
-  anything, so the note sits on the path a supporter actually takes. **Keep it there**, and keep the
-  connect line pointing at it; if that link goes, nothing discloses anything. Anything the board
-  concludes about supporter risk belongs where a supporter will read it, not only in `PROJECT.md`.
+- **The relay is a disclosed plaintext-trust relationship.** In the public pool a supporter reads a
+  stranger's prompt and that stranger reads the supporter's answer, and the two risks a supporter
+  carries are that the prompt is untrusted input reaching their agent and that a consumer
+  subscription is licensed to its holder. The full disclosure lives in `public/llms.txt`, which is
+  the file the connect line makes an agent read before it runs anything, so the note sits on the
+  path a supporter actually takes. **Keep it there**, and keep the connect line pointing at it; if
+  that link goes, nothing discloses anything. Anything the board concludes about supporter risk
+  belongs where a supporter will read it, not only in `PROJECT.md`.
   The long note came off the homepage on 2026-08-02 by the owner's decision. On 2026-08-04 a single
   sentence went back, and only because the connect line now says "I have read and accepted the
   supporter terms" on the reader's behalf — an agent stalls without it, waiting for a human who is
@@ -61,8 +73,10 @@ path through the API and is documented on the docs page; it just has no UI.
   model calls, so it runs in the gate.
 - `npm run check` = `tsc --noEmit` + `test/smoke.mts` + `test/upstash.mts` (the real Upstash
   path against a fake REST server that counts Redis commands, so cost claims are asserted, not
-  argued). It must pass before any commit. Add assertions when you add behavior. Exact counts
-  live in the `PROJECT.md` changelog, where they are a snapshot rather than a claim about now.
+  argued) + `test/e2e.mts` (the handlers over real HTTP, including a worker loop that pops a job,
+  keeps its ticket and answers it) + `test/adversary.mts`. It must pass before any commit. Add
+  assertions when you add behavior. Exact counts live in the `PROJECT.md` changelog, where they are
+  a snapshot rather than a claim about now.
 - Deploy is automatic: Vercel builds every push. **`main` → production** (`relaybee.vercel.app`);
   every PR gets a preview URL. So merging to `main` ships.
 - GitHub Actions (`.github/workflows/ci.yml`) runs `npm run check` on pushes and PRs.

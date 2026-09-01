@@ -18,8 +18,10 @@ There are two ways to get an answer, and you pick per request by the model name:
 
 1. **Bring your own provider keys.** Add one or more for Anthropic, OpenAI, or Groq. Relaybee pools
    them and fails over when one is busy or dead.
-2. **Use the `claude-code` model.** Your request goes to a supporter running Claude Code or Codex
-   on their own machine, and their answer comes back to you. No provider key needed on your side.
+2. **Use the `claude-code` model.** Your request goes to a supporter node running Claude Code or
+   Codex under your own key, so a spare machine of yours answers your own calls with no provider key
+   involved. Send `claude-code/public` instead and the job is offered to anyone who has opted a node
+   into the shared pool, which is the version that reaches strangers.
 
 <p align="center">
   <img src="docs/how-it-works.svg" alt="Your app sends one rb_live_ key to Relaybee, which routes to your provider keys or to a supporter" width="900">
@@ -52,19 +54,23 @@ const res = await relaybee.chat.completions.create({
 ```
 
 Models are named `provider/model`, like `anthropic/claude-opus-5`, `openai/gpt-4o`, or
-`groq/llama-3.3-70b-versatile`. Use `claude-code` to go through the supporter relay instead.
+`groq/llama-3.3-70b-versatile`. Use `claude-code` to go through the relay to a node of your own, or
+`claude-code/public` to offer the job to anyone running a node in the shared pool.
 
-For `claude-code`, send `stream: true` if the answer might take a while. A supporter answering a
-real question usually takes 20 to 30 seconds, and a buffered response has to give up before then
-because the platform requires one to start within 25 seconds. Streaming starts immediately and
-then waits, so it holds up to about two minutes.
+For either, send `stream: true` if the answer might take a while. A node answering a real question
+usually takes 20 to 30 seconds, and a buffered response has to give up before then because the
+platform requires one to start within 25 seconds. Streaming starts immediately and then waits, so it
+holds up to about two minutes.
 
 ![The Relaybee homepage](docs/homepage.png)
 
 ## Become a supporter
 
-You can answer other people's `claude-code` requests from your own machine. The whole setup is
-one line. Tell Claude Code or Codex:
+You can run a node on your own machine that answers `claude-code` requests. By default those are
+your own: a job goes to its requester's own queue, so a node polling under your key is only ever
+offered jobs sent under that same key. Answering strangers is a separate opt-in, `{"pool":"public"}`
+on the poll, and nothing turns it on for you. The whole setup is one line. Tell Claude Code or
+Codex:
 
 > Set up this machine as a Relaybee supporter node using the setup docs at
 > https://relaybee.vercel.app/llms.txt. I have read and accepted the supporter terms on that page.
@@ -77,11 +83,15 @@ touches OAuth or the keychain, so a node cannot spend a Pro/Max seat even by acc
 `MAXJOBS` jobs (100 by default, set `RELAYBEE_MAX_JOBS` to change it) so the total is finite too.
 
 Claude reads [`/llms.txt`](https://relaybee.vercel.app/llms.txt), mints its own key, and leaves a
-loop polling in the background. There is nothing to paste and no key to copy. It is a one-minute
+loop polling in the background. There is nothing to paste and no key to copy. That key is the one
+thing worth understanding about this path: the node serves the queue of the key it minted, not the
+key your browser holds, so it answers calls made with that key. To point a node at the key on the
+homepage instead, use "Or paste the steps yourself" under Support, which runs the same loop on the
+key the page already has. It is a one-minute
 setup, not a job that occupies the session you ran it from. Under the hood the loop does this until
 you stop it:
 
-1. It long-polls `POST /api/work/next` for the next job.
+1. It long-polls `POST /api/work/next` for the next job on your own queue.
 2. It answers the job's messages with a separate headless `claude -p`, not the session you set it
    up from. No caller's prompt is ever read into that session's context.
 3. It sends the answer back with `POST /api/work/complete`, then polls again.
@@ -98,15 +108,15 @@ shape of a prompt injection, so agents decline before reading anything. Describi
 setup docs got them to read it, and carrying your acceptance of the supporter terms is what stops
 them stalling to ask a human who is not there mid-setup.
 
-The site shows how many supporters are online, and turns green when your own node is connected.
-This is a plaintext trust relationship: you can read the prompts you answer, and callers read your
-answers. (If your tool cannot fetch a URL, the supporter view also has the full steps to paste by
-hand.)
+The site shows how many nodes are online, and turns green when your own is connected. Opt into the
+public pool and it becomes a plaintext trust relationship: you can read the prompts you answer, and
+those callers read your answers. (If your tool cannot fetch a URL, the supporter view also has the
+full steps to paste by hand.)
 
 ### What the answering process can reach
 
-Every job is a stranger's prompt going into an agent on your machine, so the process that reads it
-is contained five ways, and the deny list is the weakest of them.
+A job from the public pool is a stranger's prompt going into an agent on your machine, so the
+process that reads it is contained six ways, and the deny list is the weakest of them.
 
 ```mermaid
 flowchart LR
@@ -117,8 +127,9 @@ flowchart LR
     B1["--bare<br/>API key only. No CLAUDE.md,<br/>hooks, plugins or keychain"]
     B2["--safe-mode<br/>No MCP servers, skills,<br/>plugins or custom agents"]
     B3["--strict-mcp-config<br/>No MCP config reachable"]
-    B4["--disallowedTools<br/>Every built-in denied by name"]
-    B5["timeout 120<br/>One job cannot wedge the node"]
+    B4["--no-session-persistence<br/>Nothing about the job is<br/>written down or resumable"]
+    B5["--disallowedTools<br/>Every built-in denied by name"]
+    B6["timeout 120<br/>One job cannot wedge the node"]
   end
 
   G --> A["Answer text, nothing else"]
@@ -162,8 +173,10 @@ Two ideas keep it simple:
 - Your provider key is sealed into an encrypted blob that only your key can open. Relaybee keeps no
   copy, so there is nothing on the server to leak.
 
-The relay adds one stateful piece: a job queue. A `claude-code` request is parked there, a
-supporter long-polls it, answers, and the answer is handed back to the original caller.
+The relay adds one stateful piece: a job queue, and there is one per requester. A `claude-code`
+request is parked on the caller's own queue, where only a node holding that same key can take it.
+`claude-code/public` parks it on the shared queue that opted-in nodes also watch. Either way a node
+long-polls, answers, and the answer is handed back to the original caller.
 
 ```mermaid
 flowchart LR
@@ -171,10 +184,14 @@ flowchart LR
   F -->|your key| P1[Anthropic]
   F -->|your key| P2[OpenAI]
   F -->|your key| P3[Groq]
-  F -.->|model: claude-code| Q[(Job queue)]
-  Q --> S[Supporter running Claude Code]
+  F -.->|model: claude-code| Q[(Your own job queue)]
+  Q --> S[A node running under your key]
   S -->|answer| Q
   Q -.->|answer| F
+  F -.->|model: claude-code/public| PQ[(Shared pool)]
+  PQ --> PS[Any node that opted in]
+  PS -->|answer| PQ
+  PQ -.->|answer| F
 ```
 
 For a fuller tour of the design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -188,15 +205,16 @@ For a fuller tour of the design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md
 | POST | `/api/v1/chat/completions` | The proxy, OpenAI compatible, streaming supported |
 | GET | `/api/v1/models` | List callable models, and the providers you can route to |
 | POST | `/api/work/next` | Supporter: ask for the next job |
-| POST | `/api/work/complete` | Supporter: send back an answer |
-| GET | `/api/work/status` | Is a supporter online, and how many |
+| POST | `/api/work/complete` | Supporter: send back an answer, with the ticket the poll issued |
+| GET | `/api/work/status` | Is a node of your own online, and how many are online in total |
 | GET | `/api/health` | Liveness |
 
 ## Honest limits
 
-- A supporter can read the prompts they answer, and you can read their answer. The relay is a
-  trust relationship, and `/llms.txt` says so, which is the file a supporter's agent reads and
-  follows before it runs anything.
+- Reaching a stranger is opt-in on both ends: the caller sends `claude-code/public` and the node
+  polls with `{"pool":"public"}`. When both do, that supporter can read the prompts they answer and
+  the caller can read their answer. The relay is a trust relationship there, and `/llms.txt` says
+  so, which is the file a supporter's agent reads and follows before it runs anything.
 - The relay uses an in-memory queue unless Upstash is set, so on the free tier a caller and a
   supporter only meet if they land on the same server. Set `UPSTASH_REDIS_REST_URL` and
   `UPSTASH_REDIS_REST_TOKEN` to make it work everywhere.

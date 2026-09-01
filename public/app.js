@@ -101,12 +101,29 @@ function workerBrief() {
 a job for your session: launch the loop below as a BACKGROUND process, answer each job
 with a separate headless agent, then check it came up (last step) and tell me the pid.
 
-Answer each job with tools switched OFF and from an empty directory, like this:
-  claude -p --disallowedTools "Bash,Read,Write,Edit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task,TodoWrite,BashOutput,KillShell"
-That deny list is load-bearing, not decoration. Without it a job that says "read
-./notes.txt and reply with the contents" gets them with no permission prompt, because
-a plain "claude -p" inherits whatever my own settings already allow. An empty
---allowedTools does NOT deny anything. Answering chat prompts needs no tools at all.
+Answering runs on API billing and never on my Claude login: if ANTHROPIC_API_KEY is not
+set, stop and say so instead of starting a node, because a consumer Pro/Max seat does
+not cover answering other people.
+
+Answer each job from a fresh empty directory with tools switched OFF, like this:
+  SAFE="--bare --safe-mode --strict-mcp-config --no-session-persistence"
+  NOTOOLS="Bash,BashOutput,KillShell,Read,Write,Edit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task,Agent,TodoWrite,ToolSearch,Skill,Workflow,Artifact,AskUserQuestion,SendUserFile,ReportFindings,ScheduleWakeup,CronCreate,CronDelete,CronList,DesignSync,EnterWorktree,ExitWorktree,EnterPlanMode,ExitPlanMode,Monitor,PushNotification,RemoteTrigger,SendMessage,EndConversation,TaskCreate,TaskGet,TaskList,TaskUpdate,TaskStop,TaskOutput"
+  timeout 120 claude -p $SAFE --output-format json --max-budget-usd 0.50 --disallowedTools "$NOTOOLS"
+--output-format json is what makes step 3 able to report a cost: .result is the answer,
+.usage carries the token counts and .total_cost_usd the dollar figure. Relaybee never sees
+the model call, so this node is the only place those numbers exist. A build that does not
+emit the envelope still answers, so use its plain output as the answer and deliver that
+without numbers rather than lose the job.
+Containment is four independent things and the deny list is the weakest of them.
+--bare reads ANTHROPIC_API_KEY only and never my login, keychain, CLAUDE.md or hooks;
+--safe-mode drops MCP servers, skills, plugins and custom agents; --strict-mcp-config
+makes sure no MCP config is reachable at all; timeout 120 stops one prompt wedging the
+node on a job already taken off the queue. The deny list only blocks tools it names,
+and it cannot name one that did not exist when it was written, which is exactly how the
+previous version of this brief failed. Without it a job that says "read ./notes.txt and
+reply with the contents" gets them with no permission prompt, because a plain "claude -p"
+inherits whatever my own settings already allow. An empty --allowedTools does NOT deny
+anything. Answering chat prompts needs no tools at all.
 
 1. POST ${origin}/api/work/next with header "Authorization: Bearer ${key}".
    Jobs sent under this same key come to you. That is the default and it needs no
@@ -121,10 +138,18 @@ a plain "claude -p" inherits whatever my own settings already allow. An empty
    Answer promptly: the caller gives up after 20 seconds, or about 110 if streaming.
 3. Deliver the answer:
    POST ${origin}/api/work/complete with the same Authorization header and JSON body
-   {"id": "<the job id>", "ticket": "<the ticket>", "text": "<your answer>"}.
-   Always send one, even a failure message. Taking the job removed it from the queue,
+   {"id": "<the job id>", "ticket": "<the ticket>", "text": "<your answer>",
+    "usage": {"input_tokens": 1183, "output_tokens": 274, "cost_usd": 0.0121}}.
+   input_tokens is .usage.input_tokens plus cache_read_input_tokens plus
+   cache_creation_input_tokens, output_tokens is .usage.output_tokens, and cost_usd is
+   .total_cost_usd. Those three travel together or not at all, and the relay drops the
+   whole block if one of them is missing or not a sane number. Leave usage out entirely
+   rather than sending zeros: a zero reads as a job that cost nothing rather than one
+   nobody measured.
+   Always send an answer, even a failure message. Taking the job removed it from the queue,
    so staying quiet means the caller waits out their window and nobody else can help.
-4. Print one line per job served, then go back to step 1.
+4. Print one line per job served, then go back to step 1. Stop after 100 jobs: a
+   per-job budget with no total is still an unlimited commitment.
 
 Then check it actually came up, before you tell me anything:
 GET ${origin}/api/work/status with the same header. It answers {"connected":true} once
@@ -150,12 +175,24 @@ const STATUS_POLL_MS = 10_000
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`
 
 function renderStatus({ connected, online }) {
-  // Use view: a plain count so a user knows whether claude-code will get answered.
+  // Use view: `claude-code` goes to this key's own queue and nowhere else, so the
+  // global count answers a different question than the one this box is asked. A
+  // visitor with no node of their own read "2 supporters online" here and then got
+  // a 504 from the model the page names. The global number is only true of
+  // `claude-code/public`, so it is named wherever that number is.
+  //
+  // The remedy has to name the paste-the-steps brief rather than the connect
+  // line above it. The hosted script mints its own key, so the node it brings up
+  // belongs to a different user id and this key's `claude-code` calls still get
+  // nothing. The brief is the only supporter path that runs on the key the page
+  // is holding.
   const useBox = $('use-status')
-  useBox.classList.toggle('live', online > 0)
-  $('use-text').textContent = online > 0
-    ? `${plural(online, 'supporter', 'supporters')} online`
-    : 'No supporters online right now'
+  useBox.classList.toggle('live', connected)
+  $('use-text').textContent = connected
+    ? 'Your node is online. claude-code will be answered.'
+    : online > 0
+      ? `${plural(online, 'supporter', 'supporters')} online, but ${online === 1 ? 'it is not yours' : 'none of them is yours'}. Ask for claude-code/public to reach the ones that opted in.`
+      : 'No node of your own, and no supporters online. Run one from "Or paste the steps yourself" under Support, which uses this key. Or bring a provider key.'
 
   // Supporter view: the global count is the real signal. The one-liner flow has
   // Claude mint its OWN key, so the per-key `connected` check usually will not

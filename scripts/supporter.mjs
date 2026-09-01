@@ -45,8 +45,18 @@ const DENY = [
 const SAFE = ['--safe-mode', '--strict-mcp-config', '--no-session-persistence']
 const CANARY = 'RELAYBEE-CANARY-MUST-NOT-ESCAPE'
 
+// A flag takes the next token as its value only when that token is not itself a
+// flag. Stepping two at a time instead let a valueless `--own-traffic-only` eat
+// the name of the flag behind it, so `--own-traffic-only --max-jobs 5` silently
+// dropped the job cap and fell back to 100. That cap is the spend bound.
 const args = new Map()
-for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i].replace(/^--/, ''), process.argv[i + 1])
+for (let i = 2; i < process.argv.length; i++) {
+  const token = process.argv[i]
+  if (!token.startsWith('--')) continue
+  const value = process.argv[i + 1]
+  if (value === undefined || value.startsWith('--')) args.set(token.slice(2), 'true')
+  else { args.set(token.slice(2), value); i++ }
+}
 const flag = (n) => args.has(n) && args.get(n) !== 'false'
 
 const BASE = (args.get('base') ?? 'https://relaybee.vercel.app').replace(/\/$/, '')
@@ -210,6 +220,24 @@ async function deliver(id, ticket, text, usage) {
 }
 
 async function main() {
+  // The two flags say opposite things about who this node answers for, and the
+  // combination is exactly the accident worth preventing: a node on a consumer
+  // seat, quietly serving strangers because a second flag opted it back in.
+  if (OWN_TRAFFIC_ONLY && POOL === 'public') {
+    console.error(
+      '--own-traffic-only and --pool public contradict each other.\n' +
+      '--own-traffic-only answers on this machine\'s own login, which is only within\n' +
+      'your licence while the callers are you. --pool public takes jobs from strangers.\n' +
+      'Drop --pool public, or set ANTHROPIC_API_KEY and drop --own-traffic-only.',
+    )
+    process.exit(1)
+  }
+  // A cap that did not parse would otherwise leave the node quietly serving
+  // nothing, which reads as a broken relay rather than as a bad argument.
+  if (!Number.isFinite(MAX_JOBS) || MAX_JOBS < 1) {
+    console.error(`--max-jobs is the total spend bound and needs a positive number, got ${JSON.stringify(args.get('max-jobs'))}.`)
+    process.exit(1)
+  }
   if (!OWN_TRAFFIC_ONLY && !process.env.ANTHROPIC_API_KEY) {
     console.error(
       'ANTHROPIC_API_KEY is not set.\n' +
@@ -255,8 +283,13 @@ async function main() {
     }
     if (!job) { await telemetry({ event: 'poll_empty', waitedMs: now() - polledAt }); continue }
 
+    // job.queuedAt is stamped on the Vercel edge and every other timestamp here
+    // comes from this machine's clock, so anything that subtracts one from the
+    // other carries the skew between the two. The names say so, because these
+    // are the numbers this project quotes. pollWaitMs, agentMs, deliverMs and
+    // handledMs are all differences of local timestamps and are clean.
     const gotAt = now()
-    await telemetry({ event: 'job_received', jobId: job.id, model: job.model, queuedAt: job.queuedAt, queueWaitMs: gotAt - job.queuedAt, pollWaitMs: gotAt - polledAt })
+    await telemetry({ event: 'job_received', jobId: job.id, model: job.model, queuedAt: job.queuedAt, queueWaitMsWithSkew: gotAt - job.queuedAt, pollWaitMs: gotAt - polledAt })
 
     let text, usage, ok = true
     const startedAt = now()
@@ -283,15 +316,16 @@ async function main() {
     served++
     await telemetry({
       event: 'job_served', jobId: job.id, ok,
-      queueWaitMs: gotAt - job.queuedAt,
+      queueWaitMsWithSkew: gotAt - job.queuedAt,
       agentMs: answeredAt - startedAt,
       deliverMs: deliveredAt - answeredAt,
-      totalMs: deliveredAt - job.queuedAt,
+      handledMs: deliveredAt - gotAt,
+      totalMsWithSkew: deliveredAt - job.queuedAt,
       answerChars: text.length,
       usage: usage ?? null,
     })
     const cost = usage ? `, ${usage.input_tokens} in / ${usage.output_tokens} out, $${usage.cost_usd.toFixed(4)}` : ''
-    log(`served ${job.id.slice(0, 8)} in ${((deliveredAt - job.queuedAt) / 1000).toFixed(1)}s (${text.length} chars${cost})${ok ? '' : ' [agent failed]'}`)
+    log(`served ${job.id.slice(0, 8)} in ${((deliveredAt - gotAt) / 1000).toFixed(1)}s on this node (${text.length} chars${cost})${ok ? '' : ' [agent failed]'}`)
   }
   log(`done, ${served} job(s) served`)
   await telemetry({ event: 'node_stop', served })

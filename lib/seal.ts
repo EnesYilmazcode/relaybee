@@ -20,21 +20,29 @@ export type Connection = {
 }
 
 const PREFIX = 'fc_'
-let cachedKey: CryptoKey | null = null
+// Keyed by the secret, same as the HMAC cache in auth.ts, and for a worse reason:
+// seal() and open() share this key, so a cache that only checks for absence lets a
+// warm instance keep ENCRYPTING under a retired MASTER_ENCRYPTION_KEY after a
+// rotation. Nothing holding the new key can ever open those blobs, and there is no
+// copy of the credential on our side to re-seal, so the loss is permanent.
+let cachedKey: { secret: string; key: CryptoKey } | null = null
 
 async function aesKey(): Promise<CryptoKey> {
-  if (cachedKey) return cachedKey
   const b64 = process.env.MASTER_ENCRYPTION_KEY
   if (!b64) throw new Error('MASTER_ENCRYPTION_KEY is not set')
+  if (cachedKey && cachedKey.secret === b64) return cachedKey.key
   // b64uToBytes accepts standard base64 and base64url alike (it normalizes and
   // pads internally), so MASTER_ENCRYPTION_KEY can be in either form.
   const raw = b64uToBytes(b64)
   if (raw.length !== 32) throw new Error('MASTER_ENCRYPTION_KEY must decode to 32 bytes')
-  cachedKey = await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, [
-    'encrypt',
-    'decrypt',
-  ])
-  return cachedKey
+  cachedKey = {
+    secret: b64,
+    key: await crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, [
+      'encrypt',
+      'decrypt',
+    ]),
+  }
+  return cachedKey.key
 }
 
 export async function seal(conn: Connection): Promise<string> {

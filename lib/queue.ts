@@ -32,6 +32,11 @@ export type Result = { text: string; usage?: Usage }
 
 const RESULT_TTL_S = 120
 const NODES_KEY = 'relaybee:nodes'
+// Nodes that asked for the public pool as well as their own queue. Presence has
+// to be per-pool or it cannot answer the only question a "/public" caller has:
+// is anyone watching the queue MY job went into. The global set cannot, because
+// every node marks itself there whether it opted in or not.
+const PUBLIC_NODES_KEY = 'relaybee:nodes:public'
 
 // One queue per requester, plus one opt-in pool.
 //
@@ -84,9 +89,10 @@ interface Store {
   setResult(id: string, result: Result): Promise<void>
   /** Block until this job's answer arrives or maxWaitMs elapses. */
   waitResult(id: string, maxWaitMs: number): Promise<Result | null>
-  markPresence(userId: string): Promise<void>
+  markPresence(userId: string, watchesPublic: boolean): Promise<void>
   isPresent(userId: string): Promise<boolean>
   countPresent(): Promise<number>
+  countPresentPublic(): Promise<number>
 }
 
 type Cmd = (parts: Array<string | number>) => Promise<unknown>
@@ -174,11 +180,19 @@ function upstashStore(url: string, token: string): Store {
     // only way it gets bigger, so this ties the cleanup rate to the mess rate.
     // A counter would not: it lives in one warm instance, and a poll landing on
     // a cold one restarts it, so the degenerate case never sweeps at all.
-    markPresence: async (userId) => {
+    markPresence: async (userId, watchesPublic) => {
       // Number(), not a strict compare: cmd returns unknown, so this has no
       // type-level protection, and coercing means a stringified reply cannot
       // silently disable the sweep forever.
       const added = await cmd(['ZADD', NODES_KEY, Date.now(), userId])
+      // The second set is the opt-in one, so a node that did not ask for the
+      // public pool costs exactly what it did before: one command per beat.
+      if (watchesPublic) {
+        const addedPublic = await cmd(['ZADD', PUBLIC_NODES_KEY, Date.now(), userId])
+        if (Number(addedPublic) === 1) {
+          await cmd(['ZREMRANGEBYSCORE', PUBLIC_NODES_KEY, 0, Date.now() - PRESENCE_TTL_S * 1000]).catch(() => {})
+        }
+      }
       if (Number(added) !== 1) return
       // Swallowed on purpose: the count never depended on the sweep landing, so
       // a failed one must not turn a supporter's poll into a 503.
@@ -194,6 +208,10 @@ function upstashStore(url: string, token: string): Store {
       const cutoff = Date.now() - PRESENCE_TTL_S * 1000
       return ((await cmd(['ZCOUNT', NODES_KEY, cutoff, '+inf'])) as number) ?? 0
     },
+    countPresentPublic: async () => {
+      const cutoff = Date.now() - PRESENCE_TTL_S * 1000
+      return ((await cmd(['ZCOUNT', PUBLIC_NODES_KEY, cutoff, '+inf'])) as number) ?? 0
+    },
   }
 }
 
@@ -206,6 +224,19 @@ function memoryStore(): Store {
   }
   const results = new Map<string, { result: Result; at: number }>()
   const presence = new Map<string, number>()
+  const publicPresence = new Map<string, number>()
+
+  // Counting prunes as it goes, which is the in-memory equivalent of the ZCOUNT
+  // range read: an expired entry is never counted whether or not it is deleted.
+  const countFresh = (m: Map<string, number>) => {
+    const cutoff = Date.now() - PRESENCE_TTL_S * 1000
+    let n = 0
+    for (const [k, at] of m) {
+      if (at <= cutoff) m.delete(k)
+      else n++
+    }
+    return n
+  }
 
   const trimJobs = (jobs: Job[]) => {
     const cutoff = Date.now() - JOB_MAX_AGE_MS
@@ -257,22 +288,18 @@ function memoryStore(): Store {
         await sleep(100)
       }
     },
-    markPresence: async (userId) => { presence.set(userId, Date.now()) },
+    markPresence: async (userId, watchesPublic) => {
+      presence.set(userId, Date.now())
+      if (watchesPublic) publicPresence.set(userId, Date.now())
+    },
     isPresent: async (userId) => {
       const at = presence.get(userId)
       if (at === undefined) return false
       if (Date.now() - at > PRESENCE_TTL_S * 1000) { presence.delete(userId); return false }
       return true
     },
-    countPresent: async () => {
-      const cutoff = Date.now() - PRESENCE_TTL_S * 1000
-      let n = 0
-      for (const [k, at] of presence) {
-        if (at <= cutoff) presence.delete(k)
-        else n++
-      }
-      return n
-    },
+    countPresent: async () => countFresh(presence),
+    countPresentPublic: async () => countFresh(publicPresence),
   }
 }
 
@@ -376,8 +403,8 @@ export async function checkTicket(jobId: string, supporter: string, ticket: stri
 }
 
 /** Record that a supporter node is alive right now, keyed by its Relaybee user id. */
-export async function markLive(userId: string): Promise<void> {
-  await store.markPresence(userId)
+export async function markLive(userId: string, watchesPublic = false): Promise<void> {
+  await store.markPresence(userId, watchesPublic)
 }
 
 /** Is a supporter node currently polling under this user id? */
@@ -391,8 +418,18 @@ export async function countLive(): Promise<number> {
 }
 
 /**
- * The job id is the capability: it is an unguessable UUID handed only to the
- * supporter who popped the job, so holding it is proof of assignment.
+ * How many of those nodes opted into the public pool. This is the number a
+ * "/public" caller's fate actually depends on; the global one above is what the
+ * site shows, and the two are different questions.
+ */
+export async function countLivePublic(): Promise<number> {
+  return store.countPresentPublic()
+}
+
+/**
+ * The job id alone is not the capability. It is published to the caller as
+ * `chatcmpl-<id>`, so delivery is gated on the ticket issued to the node that
+ * popped the job; see issueTicket and checkTicket above.
  */
 export async function completeJob(id: string, text: string, usage?: Usage): Promise<void> {
   await store.setResult(id, usage ? { text, usage } : { text })

@@ -9,7 +9,7 @@ import { verifyKey, bearer } from './auth'
 import { open, type Connection } from './seal'
 import { route, ADAPTERS, type ChatRequest } from './providers'
 import { check, LIMITS, clientIp, IP_PROXY_LIMIT, rlHeaders } from './ratelimit'
-import { submitJob, awaitResult, cancelJob, countLive, isLive, type Job, type Usage, type Pool } from './queue'
+import { submitJob, awaitResult, cancelJob, countLivePublic, isLive, type Job, type Usage, type Pool } from './queue'
 import { hasSecrets, NOT_CONFIGURED } from './config'
 
 const CORS = {
@@ -74,9 +74,15 @@ export const MAX_POOL = 8
  * `object: "provider"`, which meant a picker offered "anthropic" and every pick
  * came back 400: routing wants "<provider>/<model>", not a bare provider.
  *
- * There is exactly one model Relaybee serves on its own, so `data` has one
- * entry. The providers are still worth reporting, they are just not models, so
- * they moved to their own field with the shape a caller has to build.
+ * `data` is the relay ids, built from the constants the router dispatches on so
+ * the list cannot drift from what routes. Both of them belong on it because they
+ * are different capacity: the bare id reaches only nodes running under the
+ * caller's own key, so advertising it alone hands every caller without a node of
+ * their own the one id that is guaranteed to time out for them, and hides the
+ * only id that reaches anybody else's machine.
+ *
+ * The providers are still worth reporting, they are just not models, so they
+ * moved to their own field with the shape a caller has to build.
  */
 export async function listModels(req: Request): Promise<Response> {
   if (req.method === 'OPTIONS') return preflight()
@@ -85,7 +91,7 @@ export async function listModels(req: Request): Promise<Response> {
   return new Response(
     JSON.stringify({
       object: 'list',
-      data: [{ id: RELAY_PROVIDER, object: 'model', owned_by: 'relaybee' }],
+      data: RELAY_MODELS.map((id) => ({ id, object: 'model', owned_by: 'relaybee' })),
       providers: Object.keys(ADAPTERS).map((id) => ({ id, model_format: `${id}/<model>` })),
     }),
     { headers: { 'content-type': 'application/json', ...CORS, ...g.headers } },
@@ -109,6 +115,10 @@ const RELAY_PROVIDER = 'claude-code'
 const PUBLIC_SUFFIX = 'public'
 const poolFor = (model: string): Pool =>
   model.slice(RELAY_PROVIDER.length + 1) === PUBLIC_SUFFIX ? 'public' : 'own'
+// Spelled from the same two constants poolFor reads, so a change to either one
+// moves the router and the models list together instead of leaving the list to
+// advertise a spelling that stopped routing.
+const RELAY_MODELS = [RELAY_PROVIDER, `${RELAY_PROVIDER}/${PUBLIC_SUFFIX}`]
 // The buffered path emits nothing until the answer is complete, so it is bounded
 // by Vercel Edge's ~25s initial-response deadline. Exceed that and a timeout
 // surfaces as platform 504 HTML instead of our clean JSON, so we give up first.
@@ -226,23 +236,35 @@ async function relayCompletion(body: ChatRequest, owner: string, headers: Record
  * caller to retry while a supporter is mid answer just queues the same prompt
  * twice and spends their tokens twice.
  */
-async function timedOutMessage(owner: string, pool: Pool, known?: boolean): Promise<string> {
-  let online = known
-  if (online === undefined) online = await anyoneCanServe(owner, pool)
-  if (online) {
+async function timedOutMessage(owner: string, pool: Pool, known?: Serving): Promise<string> {
+  const serving = known ?? (await anyoneCanServe(owner, pool))
+  if (serving === 'yes') {
     return `A supporter took this and did not finish inside ${RELAY_WAIT_MS / 1000}s. Send "stream": true and Relaybee holds the connection open while they work, which is what long answers need.`
   }
   return pool === 'public'
-    ? 'No node has opted into the public pool right now. Run one yourself, or drop the "/public" suffix to use your own.'
+    ? 'No node is watching the public pool right now. Run one yourself, or drop the "/public" suffix to use your own.'
     : `No node of your own is online. "${RELAY_PROVIDER}" is served by machines running a supporter node under this same API key, so start one, or send "${RELAY_PROVIDER}/${PUBLIC_SUFFIX}" to offer the job to anyone who has opted into the shared pool.`
 }
 
-/** Is there any node that could take this particular job? */
-async function anyoneCanServe(owner: string, pool: Pool): Promise<boolean> {
+/**
+ * Whether any node could take this particular job.
+ *
+ * A job goes to exactly one queue, so the presence that decides its fate is
+ * per-pool. The global count cannot answer for "/public": every node marks
+ * itself live whether or not it opted in, so a count above zero would report
+ * one own-only node anywhere in the world as capacity for a public caller and
+ * hold them for the whole streaming window on the strength of it. The opt-in is
+ * recorded where a node opts in, in api/work/next.ts, and read back here.
+ * Either way this is one presence command.
+ */
+type Serving = 'yes' | 'no'
+
+async function anyoneCanServe(owner: string, pool: Pool): Promise<Serving> {
   try {
-    return pool === 'public' ? (await countLive()) > 0 : await isLive(owner)
+    if (pool !== 'public') return (await isLive(owner)) ? 'yes' : 'no'
+    return (await countLivePublic()) > 0 ? 'yes' : 'no'
   } catch {
-    return false
+    return 'no'
   }
 }
 
@@ -268,7 +290,7 @@ function relayStream(job: Job, body: ChatRequest, owner: string, pool: Pool, cre
 
       const deadline = Date.now() + RELAY_STREAM_WAIT_MS
       let result: Awaited<ReturnType<typeof awaitResult>> = null
-      let online: boolean | undefined
+      let online: Serving | undefined
       let checked = false
 
       while (Date.now() < deadline) {
@@ -281,11 +303,14 @@ function relayStream(job: Job, body: ChatRequest, owner: string, pool: Pool, cre
         if (result !== null) break
         // One presence check, after the first empty slice. If nothing is polling
         // the queue then no answer is coming, and holding the caller for the
-        // full window would be a worse experience than the old 20s cap.
+        // full window would be a worse experience than the old 20s cap. Only a
+        // definite "no" ends the wait: an unresolved public pool still has a
+        // node that may be mid answer, and cutting that caller off at 15s is the
+        // exact failure the 110s window exists to prevent.
         if (!checked) {
           checked = true
           online = await anyoneCanServe(owner, pool)
-          if (!online) break
+          if (online === 'no') break
         }
         send(': waiting for a supporter\n\n')
       }

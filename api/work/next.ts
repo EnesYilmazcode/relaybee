@@ -71,7 +71,7 @@ export default async function handler(req: Request): Promise<Response> {
   const rl = check(`poll:${clientIp(req)}`, IP_POLL_LIMIT)
   const rlh = rlHeaders(rl)
   if (!rl.ok) {
-    return new Response(JSON.stringify({ error: { message: 'Polling too fast. One request at a time is enough — each holds for 20s.', type: 'rate_limit_error' } }), {
+    return new Response(JSON.stringify({ error: { message: 'Polling too fast. One request at a time is enough — each holds for 15s.', type: 'rate_limit_error' } }), {
       status: 429, headers: { 'content-type': 'application/json', ...CORS, ...rlh },
     })
   }
@@ -88,7 +88,7 @@ export default async function handler(req: Request): Promise<Response> {
   // not this particular poll returns a job. This is what /api/work/status reads
   // so the site can light up "connected" the moment the worker loop starts.
   try {
-    if (shouldBeat(auth.u)) await markLive(auth.u)
+    if (shouldBeat(auth.u)) await markLive(auth.u, wantsPublic)
 
     const job = await nextJob(POLL_WINDOW_MS, auth.u, wantsPublic)
     if (!job) return new Response(null, { status: 204, headers: { ...CORS, ...rlh } })

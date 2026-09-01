@@ -2,6 +2,7 @@
 //
 //   npx tsx test/live-e2e.mts                       # against production
 //   npx tsx test/live-e2e.mts --base http://...     # against a preview or local
+//   npx tsx test/live-e2e.mts --public-pool         # also answer strangers, API billing
 //
 // Everything else in test/ boots the handlers in-process with throwaway secrets.
 // That proves the logic and proves nothing about the thing users actually hit, so
@@ -16,6 +17,12 @@
 // inference gets 391 out of 17 x 23.
 //
 // Costs real model calls on whatever account runs the supporter. --jobs bounds it.
+//
+// A bare run answers only its own callers: the nodes it starts watch the queue of
+// the key this run minted for them, and nothing else holds that key. --public-pool
+// points them at the shared pool instead, where a genuine stranger's prompt can be
+// handed to the machine running the suite. That one answers on ANTHROPIC_API_KEY,
+// never on the operator's Claude login, and it refuses to start without one.
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdir, writeFile, appendFile, readFile } from 'node:fs/promises'
@@ -23,15 +30,29 @@ import { join } from 'node:path'
 
 // --- options -----------------------------------------------------------------
 
+// A flag takes the next token as its value only when that token is not itself a
+// flag, so `--public-pool` and `--public-pool true` both mean the same thing.
 const argv = new Map<string, string>()
-for (let i = 2; i < process.argv.length; i += 2) argv.set(process.argv[i].replace(/^--/, ''), process.argv[i + 1])
+for (let i = 2; i < process.argv.length; i++) {
+  const token = process.argv[i]
+  if (!token.startsWith('--')) continue
+  const value: string | undefined = process.argv[i + 1]
+  if (value === undefined || value.startsWith('--')) argv.set(token.slice(2), 'true')
+  else { argv.set(token.slice(2), value); i++ }
+}
+const flag = (n: string) => argv.has(n) && argv.get(n) !== 'false'
 
 const BASE = (argv.get('base') ?? 'https://relaybee.vercel.app').replace(/\/$/, '')
 const JOBS = Number(argv.get('jobs') ?? 8)
 const SUPPORTERS = Number(argv.get('supporters') ?? 2)
 const CONCURRENCY = Number(argv.get('concurrency') ?? 4)
 const OUT = argv.get('out') ?? join(process.cwd(), 'telemetry')
-const SKIP_RELAY = argv.get('skip-relay') === 'true'
+const SKIP_RELAY = flag('skip-relay')
+
+// Opting the nodes this run starts into the shared pool means a stranger's job
+// can land on the operator's machine, so it is a flag rather than a default and
+// it drags API billing along with it. See the note above the spawn.
+const PUBLIC_POOL = flag('public-pool')
 
 const started = Date.now()
 const RUN = 'live-' + new Date(started).toISOString().replace(/[:.]/g, '-')
@@ -167,7 +188,22 @@ const QUESTIONS = [
 // --- run -----------------------------------------------------------------------
 
 const supporters: ChildProcess[] = []
-const summary: Record<string, unknown> = { run: RUN, base: BASE, startedAt: new Date(started).toISOString() }
+const summary: Record<string, unknown> = { run: RUN, base: BASE, pool: PUBLIC_POOL ? 'public' : 'own', startedAt: new Date(started).toISOString() }
+
+// Set before every deliberate kill, so a node the run stopped is not reported as
+// a node that fell over.
+let stoppingNodes = false
+
+/** Stop the run on a node that will never answer, and say what it printed. */
+function nodeDied(label: string, why: string, stderr: string) {
+  if (stoppingNodes) return
+  stoppingNodes = true
+  for (const c of supporters) c.kill()
+  console.error(red('\n' + label + ' ' + why))
+  if (stderr.trim()) console.error(stderr.trim().split('\n').map((l) => '  ' + l).join('\n'))
+  console.error(red('live run aborted: no supporter node is up, so nothing can answer.'))
+  process.exit(1)
+}
 
 function stats(xs: number[]) {
   if (!xs.length) return null
@@ -177,8 +213,19 @@ function stats(xs: number[]) {
 }
 
 async function main() {
+  // Said here rather than only in the header, because this is the run that can
+  // hand a stranger's prompt to the machine it is running on.
+  if (PUBLIC_POOL && !process.env.ANTHROPIC_API_KEY) {
+    console.error(red('--public-pool needs ANTHROPIC_API_KEY.\n') +
+      'It puts the nodes this run starts into the shared pool, so a real caller who is\n' +
+      'not this run can send them a prompt and read the answer. Answering other people\n' +
+      'is outside a consumer Claude seat, so those nodes run on API billing or not at all.')
+    process.exit(1)
+  }
+
   await mkdir(OUT, { recursive: true })
   console.log('\n' + bold('Relaybee live end-to-end') + '  ' + dim(BASE) + '\n' + dim('run ' + RUN))
+  if (PUBLIC_POOL) console.log(red('--public-pool: these nodes will take jobs from strangers, on ANTHROPIC_API_KEY.'))
 
   // --- preflight ---------------------------------------------------------------
   section('Preflight: is the deployment alive and configured', 'preflight')
@@ -306,24 +353,34 @@ async function main() {
   for (let i = 0; i < SUPPORTERS; i++) {
     const k = await mint('supporter' + (i + 1))
     nodeKeys.push(k.key)
-    // Two flags carry real meaning here, so neither is boilerplate.
+    // Which queue these nodes watch decides who can reach them, so it is the
+    // one option here that is not a tuning knob.
     //
-    // --own-traffic-only: this run's callers are this run, so the node answers
-    // its operator's own questions on its operator's own login. That is the one
-    // shape the API-billing rule does not cover, and it is why the flag exists
-    // rather than the test quietly dropping --bare.
+    // By default they watch their own: the key was minted seconds ago and only
+    // this run holds it, so the only prompts that can arrive are this run's own.
+    // That is what makes --own-traffic-only honest, which answers on the
+    // operator's Claude login rather than on API billing. The concurrency shape
+    // survives it, because the callers below use these same keys, so several
+    // callers still land on several nodes.
     //
-    // --pool public: several callers against several nodes is the throughput
-    // shape worth measuring, and the private path pairs exactly one key with
-    // one node by design. So the concurrency run goes through the pool, which
-    // both sides opt into, and the private path is asserted separately below.
+    // --pool public reaches strangers' jobs, which is a different measurement
+    // and a real exposure, so it drops --own-traffic-only and the node falls
+    // back to --bare and refuses to start without ANTHROPIC_API_KEY.
+    const label = 'node-' + (i + 1)
     const child = spawn(process.execPath, [
       join(process.cwd(), 'scripts', 'supporter.mjs'),
-      '--base', BASE, '--key', k.key, '--label', 'node-' + (i + 1), '--telemetry', EVENTS,
-      '--own-traffic-only', 'true', '--pool', 'public', '--max-jobs', String(JOBS + 2),
+      '--base', BASE, '--key', k.key, '--label', label, '--telemetry', EVENTS,
+      '--max-jobs', String(JOBS + 2),
+      ...(PUBLIC_POOL ? ['--pool', 'public'] : ['--own-traffic-only', 'true']),
     ], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let stderr = ''
     child.stdout.on('data', (d) => process.stdout.write(dim('  ' + String(d).trimEnd()) + '\n'))
-    child.stderr.on('data', (d) => process.stderr.write(red('  ' + String(d).trimEnd()) + '\n'))
+    child.stderr.on('data', (d) => { stderr += String(d); process.stderr.write(red('  ' + String(d).trimEnd()) + '\n') })
+    // A node that dies at startup, on a missing agent or a failed containment
+    // probe, otherwise costs the run every timeout in the suite and then fails
+    // as "nobody answered", which points at the relay instead of at the node.
+    child.on('error', (e) => nodeDied(label, 'could not be started: ' + e.message, stderr))
+    child.on('exit', (code) => { if (code !== 0 && code !== null) nodeDied(label, 'exited ' + code + ' before the run finished', stderr) })
     supporters.push(child)
   }
 
@@ -372,9 +429,15 @@ async function main() {
   }
   const results: Result[] = []
   // A key per caller, so this is a real multi-tenant run rather than one client in
-  // a loop. Minting is IP-limited at 10/min, so callers share a small pool of keys.
-  const extra = await Promise.all([mint('carol'), mint('dave')])
-  const callerKeys = [alice.key, bob.key, extra[0].key, extra[1].key]
+  // a loop. On the private path the callers are the node keys, because that is
+  // what "your own queue" means and it is the only way a caller reaches a node
+  // without going through the pool. Lanes outnumber nodes, so each node still
+  // takes concurrent callers and the throughput shape is the same one the pool
+  // used to measure. Minting is IP-limited at 10/min, hence the small pool.
+  const relayModel = PUBLIC_POOL ? 'claude-code/public' : 'claude-code'
+  const callerKeys = PUBLIC_POOL
+    ? [alice.key, bob.key, ...(await Promise.all([mint('carol'), mint('dave')])).map((k) => k.key)]
+    : nodeKeys
 
   let next = 0
   await Promise.all(Array.from({ length: CONCURRENCY }, async (_unused, lane) => {
@@ -386,7 +449,7 @@ async function main() {
       // streamed one 110s, and real agents do not reliably fit the first.
       const stream = i % 2 === 1
       const key = callerKeys[lane % callerKeys.length]
-      const r = await complete(key, { model: 'claude-code/public', stream, messages: [{ role: 'user', content: q }] })
+      const r = await complete(key, { model: relayModel, stream, messages: [{ role: 'user', content: q }] })
       const correct = expect.test(r.text)
       results.push({ i, q, stream, status: r.status, totalMs: r.totalMs, firstByteMs: r.firstByteMs, answer: r.text.slice(0, 120), correct, usage: r.usage })
       await event({ event: 'caller_result', i, stream, status: r.status, totalMs: r.totalMs, firstByteMs: r.firstByteMs, correct, answerChars: r.text.length })
@@ -415,8 +478,8 @@ async function main() {
   console.log(dim('  reported spend across this run: $' + spend.toFixed(4)))
   summary.reportedSpendUsd = spend
 
-  // The private path is the default and the one that matters, so prove it too:
-  // one caller, one node, the same key, no pool involved.
+  // One caller, one node, the same key, nothing in flight. Under --public-pool
+  // this is the only check that touches the private path at all.
   const soloKey = nodeKeys[0]
   const solo = await complete(soloKey, {
     model: 'claude-code', stream: true,
@@ -447,6 +510,7 @@ async function finish() {
   // own telemetry line for it, so killing immediately loses one job from the
   // supporter-side stats. Let the writes land, then stop the nodes.
   if (supporters.length) await new Promise((r) => setTimeout(r, 1500))
+  stoppingNodes = true
   for (const c of supporters) c.kill()
 
   // Supporter-side timings come from the node's own telemetry, so the report has
@@ -454,11 +518,15 @@ async function finish() {
   const lines = (await readFile(EVENTS, 'utf8')).split('\n').filter(Boolean).map((l) => JSON.parse(l))
   const servedJobs = lines.filter((l: any) => l.event === 'job_served')
   if (servedJobs.length) {
+    // The queue wait is the one figure here that subtracts a Vercel timestamp
+    // from a local one, so it carries the skew between the two clocks and is
+    // named for it. Everything else is measured end to end on the node.
     summary.supporter = {
       served: servedJobs.length,
-      queueWaitMs: stats(servedJobs.map((j: any) => j.queueWaitMs)),
+      queueWaitMsWithSkew: stats(servedJobs.map((j: any) => j.queueWaitMsWithSkew)),
       agentMs: stats(servedJobs.map((j: any) => j.agentMs)),
       deliverMs: stats(servedJobs.map((j: any) => j.deliverMs)),
+      handledMs: stats(servedJobs.map((j: any) => j.handledMs)),
     }
   }
 
@@ -478,7 +546,8 @@ async function finish() {
   }
   if (summary.supporter) {
     const s = summary.supporter as any
-    console.log(dim('supporter side  queue wait p50 ' + s.queueWaitMs.p50 + 'ms  model p50 ' + s.agentMs.p50 + 'ms  deliver p50 ' + s.deliverMs.p50 + 'ms'))
+    console.log(dim('supporter side  model p50 ' + s.agentMs.p50 + 'ms  deliver p50 ' + s.deliverMs.p50 + 'ms  answered p50 ' + s.handledMs.p50 + 'ms'))
+    console.log(dim('                queue wait p50 ' + s.queueWaitMsWithSkew.p50 + 'ms, which includes the skew between this clock and the edge'))
   }
   console.log(dim('telemetry  ' + EVENTS))
   console.log(dim('summary    ' + join(OUT, RUN + '.json') + '\n'))
@@ -490,9 +559,10 @@ async function finish() {
   }
 }
 
-process.on('SIGINT', () => { for (const c of supporters) c.kill(); process.exit(130) })
+process.on('SIGINT', () => { stoppingNodes = true; for (const c of supporters) c.kill(); process.exit(130) })
 
 main().catch(async (e) => {
+  stoppingNodes = true
   for (const c of supporters) c.kill()
   console.error(red('\nlive run aborted: ' + (e?.stack ?? e)))
   process.exit(1)

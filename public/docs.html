@@ -44,9 +44,14 @@
   </section>
 
   <h2>1. The call that needs no provider key</h2>
-  <p>Send the model <code>claude-code</code> and your request goes to a supporter's machine, which
-  answers it and sends the answer back. Your key is the only credential involved.</p>
-  <p>Send <code>"stream": true</code> for this model. Not for the typing effect: a supporter takes
+  <p>Two model strings, and the difference is whose machine answers. <code>claude-code</code> goes
+  to a supporter node running under this same key, so the job is only ever offered to your own
+  machines. <code>claude-code/public</code> offers it to anyone who has opted a node into the shared
+  pool, which is how you get an answer without running anything yourself, and it means a stranger
+  reads your prompt and writes what comes back. Your key is the only credential either way.</p>
+  <p>The examples below send <code>claude-code/public</code>, because that is the one somebody else
+  can answer. Drop the <code>/public</code> once you are running a node of your own.</p>
+  <p>Send <code>"stream": true</code> for either of them. Not for the typing effect: a node takes
   20 to 30 seconds on a real question, and a buffered response has to give up before then because
   the platform requires one to start within 25 seconds. A streaming response starts immediately and
   then holds for up to about 110 seconds, which is the only window long enough to actually receive
@@ -64,7 +69,7 @@
 <pre data-fill>curl -N __ORIGIN__/api/v1/chat/completions \
   -H "Authorization: Bearer __KEY__" \
   -H "Content-Type: application/json" \
-  -d '{"model":"claude-code",
+  -d '{"model":"claude-code/public",
        "stream":true,
        "messages":[{"role":"user","content":"Say hello in one sentence."}]}'</pre>
       </div>
@@ -74,7 +79,7 @@
       <div class="snippet">
         <button class="copy" aria-label="Copy this snippet">copy</button>
 <pre data-fill>$body = @{
-  model    = 'claude-code'
+  model    = 'claude-code/public'
   stream   = $true
   messages = @(@{ role = 'user'; content = 'Say hello in one sentence.' })
 } | ConvertTo-Json -Depth 5
@@ -91,14 +96,17 @@ curl.exe -N __ORIGIN__/api/v1/chat/completions `
   </div>
 
   <h2>2. Or run it right here</h2>
-  <p>Same request, same key, sent from this page. If it answers, your key works.</p>
+  <p>Same request, same key, sent from this page. If it answers, your key works. It sends
+  <code>claude-code/public</code> unless a node of your own is online, in which case it sends
+  <code>claude-code</code> and the prompt stays on your machine. The public pool means a stranger's
+  machine answers it and reads what you type here, so treat this box as public.</p>
 
   <section class="panel">
     <label for="try-prompt">Prompt</label>
     <textarea id="try-prompt" rows="2">Explain what an API proxy is, in two sentences.</textarea>
     <div class="tryrow">
       <button id="btn-try" class="solid">Send</button>
-      <span class="hint" id="try-note">Goes to a supporter. Needs one online.</span>
+      <span class="hint" id="try-note">Sends claude-code/public unless a node of your own is online.</span>
     </div>
     <pre id="try-out" hidden></pre>
   </section>
@@ -125,7 +133,7 @@ const relaybee = new OpenAI({
 })
 
 const stream = await relaybee.chat.completions.create({
-  model: 'claude-code',
+  model: 'claude-code/public',
   messages: [{ role: 'user', content: 'Say hello in one sentence.' }],
   stream: true,
 })
@@ -144,7 +152,7 @@ for await (const part of stream) {
 relaybee = OpenAI(base_url="__ORIGIN__/api/v1", api_key="__KEY__")
 
 stream = relaybee.chat.completions.create(
-    model="claude-code",
+    model="claude-code/public",
     messages=[{"role": "user", "content": "Say hello in one sentence."}],
     stream=True,
 )
@@ -163,6 +171,9 @@ OPENAI_API_KEY=__KEY__</pre>
       </div>
     </div>
   </div>
+
+  <p class="hint">These send <code>claude-code/public</code>, the shared pool. Use plain
+  <code>claude-code</code> to keep a job on the nodes running under your own key.</p>
 
   <h2>4. Bringing your own provider key</h2>
   <p>The other path. Instead of a supporter, Relaybee calls Anthropic, OpenAI, or Groq with a
@@ -230,14 +241,16 @@ curl.exe __ORIGIN__/api/v1/chat/completions `
   <table>
     <thead><tr><th>Model string</th><th>Goes to</th><th>Needs</th></tr></thead>
     <tbody>
-      <tr><td><code>claude-code</code></td><td>A supporter's machine</td><td>Your key only</td></tr>
+      <tr><td><code>claude-code</code></td><td>A node running under your own key</td><td>Your key, and a node of your own</td></tr>
+      <tr><td><code>claude-code/public</code></td><td>Any node that opted into the shared pool</td><td>Your key only</td></tr>
       <tr><td><code>anthropic/&lt;model&gt;</code></td><td>Anthropic</td><td>A sealed connection</td></tr>
       <tr><td><code>openai/&lt;model&gt;</code></td><td>OpenAI</td><td>A sealed connection</td></tr>
       <tr><td><code>groq/&lt;model&gt;</code></td><td>Groq</td><td>A sealed connection</td></tr>
     </tbody>
   </table>
-  <p class="hint">The part after the slash is passed to the provider untouched, so
+  <p class="hint">On a provider model the part after the slash is passed through untouched, so
   <code>anthropic/claude-opus-5</code> and <code>groq/llama-3.3-70b-versatile</code> both work.
+  <code>claude-code</code> is the exception: its slash names a pool, not a model.
   <code>GET /api/v1/models</code> lists the models you can call without bringing anything, and the providers you can route to if you do.</p>
 
   <h2>When it does not work</h2>
@@ -249,7 +262,7 @@ curl.exe __ORIGIN__/api/v1/chat/completions `
       <tr><td>403</td><td>A connection blob was sealed by a different key.</td><td>Blobs are bound to their owner. Reseal with the key you are using now.</td></tr>
       <tr><td>429</td><td>Rate limited.</td><td>20 requests a minute per key, 60 per source address. <code>X-RateLimit-Reset</code> says when.</td></tr>
       <tr><td>502</td><td>The relay queue is unreachable.</td><td>Transient. Retry shortly.</td></tr>
-      <tr><td>504</td><td>No supporter answered in time.</td><td>The message distinguishes "nobody is online" from "someone is still writing". For the second, use <code>"stream": true</code>.</td></tr>
+      <tr><td>504</td><td>Nobody answered in time.</td><td>The message says which: no node of your own for <code>claude-code</code>, nobody opted into the pool for <code>claude-code/public</code>, or a node that is still writing. For the last, use <code>"stream": true</code>.</td></tr>
       <tr><td>503</td><td>Relaybee itself is missing a server secret.</td><td>Not your side. Nothing to retry.</td></tr>
     </tbody>
   </table>
@@ -264,7 +277,7 @@ curl.exe __ORIGIN__/api/v1/chat/completions `
       <tr><td><code>POST /api/connect</code></td><td>Seal a provider key into a blob you keep.</td></tr>
       <tr><td><code>POST /api/v1/chat/completions</code></td><td>The one that answers questions.</td></tr>
       <tr><td><code>GET /api/v1/models</code></td><td>List callable models, and the providers you can route to.</td></tr>
-      <tr><td><code>GET /api/work/status</code></td><td>How many supporters are online, and whether one of them is yours.</td></tr>
+      <tr><td><code>GET /api/work/status</code></td><td>Whether a node of your own is online, and how many are online in total.</td></tr>
       <tr><td><code>GET /api/health</code></td><td>Liveness, queue backend, deployed commit.</td></tr>
     </tbody>
   </table>
@@ -275,10 +288,13 @@ curl.exe __ORIGIN__/api/v1/chat/completions `
   <h2>Worth knowing</h2>
   <ul>
     <li>Relaybee keeps no record of your key, so a lost key cannot be shown again. Copy it somewhere.</li>
-    <li>A <code>claude-code</code> answer is written by a stranger's machine, and that stranger can
-    read your prompt. It is a disclosed trust relationship in both directions.</li>
-    <li>The relay only answers while somebody is running a supporter node. The count above is the
-    honest signal for whether the next call will be answered.</li>
+    <li>A <code>claude-code/public</code> answer is written by a stranger's machine, and that
+    stranger can read your prompt. It is a disclosed trust relationship in both directions. Plain
+    <code>claude-code</code> never leaves the nodes running under your own key.</li>
+    <li>Either way somebody has to be running a node. For <code>claude-code</code> that is your own,
+    which the light above reports directly. For <code>claude-code/public</code> the count is a
+    ceiling rather than a promise: watching the shared pool is opt-in, and the count cannot see who
+    opted in.</li>
     <li>This is a demo on free hosting, not a production service.</li>
   </ul>
 

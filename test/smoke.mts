@@ -44,9 +44,34 @@ t('a second user id round-trips independently', secondPayload?.u === 'enes_secon
 // only means something if the record has a single form.
 t('a key with junk after a second dot is rejected', (await verifyKey(secondKey + '.trailing')) === null)
 t('a key with padding spliced into the signature is rejected', (await verifyKey(secondKey + '=')) === null)
-t('a key with a non-canonical final character is rejected',
-  (await verifyKey(secondKey.slice(0, -1) + (secondKey.endsWith('A') ? 'B' : 'A'))) === null ||
-  (await verifyKey(secondKey.slice(0, -1) + 'Q')) === null)
+// The alternate final character has to be computed, not guessed. A signature is
+// 32 bytes in 43 base64url characters, so the last one carries four significant
+// bits and two spare ones, and its alphabet index is always a multiple of four:
+// the three characters above it in that group are the only other spellings of
+// the same 32 bytes. A guessed letter almost always lands in a different group,
+// where it changes real signature bits and the HMAC refuses it on its own, so
+// this assertion used to stay green with the canonical check deleted from
+// lib/auth.ts, which is the one thing it exists to catch.
+const B64U_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+const finalTwins = (s: string): string[] => {
+  const i = B64U_ALPHABET.indexOf(s.slice(-1))
+  const group = i - (i % 4)
+  return [group, group + 1, group + 2, group + 3]
+    .filter((n) => n !== i)
+    .map((n) => s.slice(0, -1) + B64U_ALPHABET[n])
+}
+const keyTwins = finalTwins(secondKey)
+// Control, so this cannot quietly stop testing anything: decode both signatures
+// with Node's own base64url reader (not the one under test) and insist they are
+// the same bytes. If the encoding ever changes so they are not, the rejections
+// below are being carried by the HMAC again.
+const sameSignatureBytes = (a: string, b: string) =>
+  Buffer.compare(Buffer.from(a.split('.')[1], 'base64url'), Buffer.from(b.split('.')[1], 'base64url')) === 0
+t('the computed twins really are other spellings of the same signature',
+  keyTwins.length === 3 && keyTwins.every((k) => sameSignatureBytes(k, secondKey)),
+  `${secondKey.slice(-1)} -> ${keyTwins.map((k) => k.slice(-1)).join('')}`)
+t('every non-canonical spelling of the final character is rejected',
+  (await Promise.all(keyTwins.map((k) => verifyKey(k)))).every((p) => p === null))
 t('the canonical spelling still verifies', (await verifyKey(secondKey))?.u === 'enes_second')
 
 // payload swap: pair one key's body with another key's signature. The HMAC is over
@@ -94,6 +119,73 @@ t('sealed blob carries the fc_ prefix', blob.startsWith('fc_'))
 t('the owner can open their own blob', (await open(blob, 'enes_abc123'))?.apiKey === 'sk-ant-secret')
 t('another user CANNOT open the blob', (await open(blob, 'mallory_999')) === null)
 t('a tampered blob is rejected', (await open(blob.slice(0, -4) + 'AAAA', 'enes_abc123')) === null)
+
+// Rotating MASTER_ENCRYPTION_KEY is the only revocation this project has, and
+// seal.ts is the half where a stale cache does permanent damage rather than
+// transient: an instance that keeps ENCRYPTING under a retired key writes blobs
+// nothing holding the new key can ever open, and there is no server-side copy of
+// the credential to re-seal from. Warm the cache first, because a cache that
+// only checks for absence is correct right up until it holds something.
+console.log('%sseal rotation - a rotated key takes effect on a warm instance, both ways', String.fromCharCode(10))
+{
+  const KEY_A = process.env.MASTER_ENCRYPTION_KEY!
+  const KEY_B = Buffer.from(new Uint8Array(32).fill(23)).toString('base64url')
+  const KEY_C = Buffer.from(new Uint8Array(32).fill(11)).toString('base64url')
+  const OWNER = 'rotation_user'
+  const rotConn = { provider: 'anthropic', apiKey: 'sk-ant-rotate', owner: OWNER, createdAt: Date.now() }
+  const bytes = (s: string) => new Uint8Array(Buffer.from(s, 'base64url'))
+  const threw = async (fn: () => Promise<unknown>): Promise<string> => {
+    try { await fn(); return '' } catch (e) { return (e as Error).message }
+  }
+  try {
+    const underA = await seal(rotConn)
+    process.env.MASTER_ENCRYPTION_KEY = KEY_B
+    const underB = await seal(rotConn)
+
+    // Round-tripping through open() would pass either way, because a stale cache
+    // is stale on both sides. Decrypt by hand under a key imported fresh from B,
+    // which is what a cold instance after the rotation actually holds.
+    const [ivPart, ctPart] = underB.slice('fc_'.length).split('.')
+    const freshB = await crypto.subtle.importKey('raw', bytes(KEY_B), { name: 'AES-GCM' }, false, ['decrypt'])
+    let reread: string | null = null
+    try {
+      const plain = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: bytes(ivPart), additionalData: new TextEncoder().encode(OWNER) },
+        freshB, bytes(ctPart),
+      )
+      reread = (JSON.parse(new TextDecoder().decode(plain)) as { apiKey: string }).apiKey
+    } catch { /* sealed under the retired key, so it stays null */ }
+    t('a blob sealed after a rotation is readable under the NEW key', reread === 'sk-ant-rotate', JSON.stringify(reread))
+    t('and a blob sealed under the retired key stops opening', (await open(underA, OWNER)) === null)
+
+    // One import per distinct secret: not one per process, which is what let the
+    // rotation be ignored, and not one per call, which measured 86% slower.
+    process.env.MASTER_ENCRYPTION_KEY = KEY_C
+    const subtle = crypto.subtle as unknown as Record<string, (...a: unknown[]) => unknown>
+    const realImport = subtle.importKey
+    let imports = 0
+    subtle.importKey = (...a: unknown[]) => { imports++; return realImport.call(crypto.subtle, ...a) }
+    const underC = await seal(rotConn)
+    const backC = await open(underC, OWNER)
+    subtle.importKey = realImport
+    t('the key is imported once per secret, not once per call',
+      imports === 1 && backC?.apiKey === 'sk-ant-rotate', `${imports} import(s) across a seal and an open`)
+
+    // The checks below the cache have to run again when the secret changes, or a
+    // warm instance silently keeps serving under a value that is no longer valid.
+    process.env.MASTER_ENCRYPTION_KEY = Buffer.from(new Uint8Array(16).fill(9)).toString('base64url')
+    const short = await threw(() => seal(rotConn))
+    t('a rotated-in key of the wrong length is caught, not short-circuited', /32 bytes/.test(short), short)
+
+    delete process.env.MASTER_ENCRYPTION_KEY
+    const unset = await threw(() => seal(rotConn))
+    t('and unsetting it throws rather than serving from a warm cache', /is not set/.test(unset), unset)
+  } finally {
+    process.env.MASTER_ENCRYPTION_KEY = KEY_A
+  }
+  t('sealing recovers once the original key is restored',
+    (await open(await seal(rotConn), OWNER))?.apiKey === 'sk-ant-rotate')
+}
 
 console.log('\nrouting — provider prefixes')
 t('routes anthropic/<model>', route('anthropic/claude-opus-5')?.model === 'claude-opus-5')
@@ -749,6 +841,21 @@ t('answering runs on API billing rather than the human seat',
 t('the worker answers from a throwaway directory rather than wherever it started',
   /mktemp -d/.test(llms))
 t('the worker script records a pid so the stop instruction works', /relaybee_worker\.pid/.test(llms))
+// Relaybee never sees the model call, so a node is the only place the tokens and
+// the dollars a job cost exist. The loop used to deliver {id, ticket, text} and
+// nothing else, which meant every node onboarded through the connect line
+// reported no usage and every caller read zeros in a product about cost. Pin the
+// whole chain: ask for the envelope, read the answer out of it, build the numbers
+// from the agent's own accounting, and send them.
+t('the worker asks the agent for a machine-readable envelope',
+  /--output-format json/.test(llms) && /\.result/.test(llms))
+t('and builds the usage numbers from what the agent reported',
+  /total_cost_usd/.test(llms) && /cache_read_input_tokens/.test(llms))
+t('and actually sends them with the answer', /usage:\$usage/.test(llms))
+// The protocol section is what somebody writing their own worker reads, so the
+// documented body has to carry the same three fields the endpoint accepts.
+t('the documented completion body names all three usage fields',
+  /input_tokens/.test(llms) && /output_tokens/.test(llms) && /cost_usd/.test(llms))
 // The board concluded both of these carry real risk for a supporter. They belong
 // where a supporter reads, not only in PROJECT.md (#72).
 // CLAUDE.md and CONTRIBUTING both promise a strict CSP on every page. Pin every
@@ -829,9 +936,106 @@ t('the homepage states the terms beside the line that accepts them',
 // rather than trusting a pid.
 t('the pasted brief also verifies the node instead of trusting a pid',
   /work\/status/.test(appJs) && /"connected":true/.test(appJs))
-// Both supporter paths must sandbox, not just the hosted script.
-t('the pasted brief carries the same deny list as the hosted script',
-  /--disallowedTools/.test(appJs) && /WebFetch/.test(appJs))
+// Both supporter paths must contain the answering process the same way. The old
+// check here was that both files mention --disallowedTools and WebFetch, and
+// both did for months while the brief passed none of the flags that do the real
+// work and denied 13 tools against llms.txt's 41. Two words present in both
+// files is not parity, so derive the sets and compare them, and read the brief
+// the way a supporter gets it, rendered, rather than as source text.
+{
+  // app.js is a page script: importing it runs addEventListener against elements
+  // that do not exist here, so lift the two functions out of the shipped file by
+  // brace matching and drive those. That keeps this a check on what is served.
+  const lift = (src: string, name: string): string => {
+    const at = src.indexOf(`function ${name}(`)
+    if (at < 0) return ''
+    let depth = 0
+    for (let i = src.indexOf('{', src.indexOf(')', at)); i < src.length; i++) {
+      if (src[i] === '{') depth++
+      else if (src[i] === '}' && --depth === 0) return src.slice(at, i + 1)
+    }
+    return ''
+  }
+  const renderBrief = new Function('origin', 'relaybeeKey', `${lift(appJs, 'workerBrief')}\nreturn workerBrief()`) as
+    (origin: string, key: string) => string
+  const brief = renderBrief('https://relaybee.test', 'rb_live_smoke.key')
+  const flagsOf = (src: string) => new Set((/SAFE="([^"]+)"/.exec(src)?.[1] ?? '').trim().split(/\s+/).filter(Boolean))
+  // Either shape of deny list: the named variable both files carry now, or the
+  // list written straight into the command, which is what the brief used to do.
+  const denyOf = (src: string) => {
+    const named = /NOTOOLS="([^"]+)"/.exec(src)?.[1]
+    const inline = /--disallowedTools "([^"$]+)"/.exec(src)?.[1]
+    return new Set((named ?? inline ?? '').split(',').map((s) => s.trim()).filter(Boolean))
+  }
+
+  t('the brief renders with the origin and the key substituted in',
+    brief.includes('https://relaybee.test/api/work/next') && brief.includes('rb_live_smoke.key'), `len=${brief.length}`)
+  t('the brief names the four containment mechanisms llms.txt relies on',
+    ['--bare', '--safe-mode', '--strict-mcp-config'].every((f) => brief.includes(f)) && /timeout 120 claude/.test(brief))
+  // --bare reads ANTHROPIC_API_KEY and nothing else, which is what makes the
+  // licensing answer structural. The brief has to say so, or an agent starts a
+  // node on whatever login the machine happens to be carrying.
+  t('and stops rather than billing whatever login the machine has', /ANTHROPIC_API_KEY/.test(brief))
+  t('and bounds the total spend, not only the per-job spend',
+    /--max-budget-usd/.test(brief) && /Stop after 100 jobs/.test(brief))
+
+  const briefFlags = flagsOf(brief)
+  const hostedFlags = flagsOf(llms)
+  t('the two supporter paths pass the same containment flags',
+    hostedFlags.size >= 4 && briefFlags.size === hostedFlags.size && [...hostedFlags].every((f) => briefFlags.has(f)),
+    `brief: ${[...briefFlags].join(' ')} | hosted: ${[...hostedFlags].join(' ')}`)
+  const briefDeny = denyOf(brief)
+  const hostedDeny = denyOf(llms)
+  const missingFromBrief = [...hostedDeny].filter((n) => !briefDeny.has(n))
+  t('and the brief denies every tool the hosted script denies',
+    hostedDeny.size >= 30 && missingFromBrief.length === 0,
+    missingFromBrief.join(', ') || `${briefDeny.size} names on both`)
+  // Named on its own because it is the specific tool a stranger's prompt reached
+  // this machine's Gmail and Calendar tools through, straight past the
+  // fourteen-name list both paths used to carry.
+  t('including ToolSearch by name, on both paths', briefDeny.has('ToolSearch') && hostedDeny.has('ToolSearch'))
+
+  // The status line, driven rather than grepped. The count and the light answer
+  // different questions now that a job goes to its requester's own queue: a
+  // visitor with no node of their own read "3 supporters online" with the dot
+  // lit, and then got a 504 from the model the page names.
+  type StubCell = { textContent: string; live: boolean | null; classList: { toggle: (cls: string, on: boolean) => void } }
+  const cells: Record<string, StubCell> = {}
+  const cell = (id: string): StubCell => {
+    if (!cells[id]) {
+      const c: StubCell = { textContent: '', live: null, classList: { toggle: (cls, on) => { if (cls === 'live') c.live = on } } }
+      cells[id] = c
+    }
+    return cells[id]
+  }
+  const pluralLine = appJs.split('\n').find((l) => l.startsWith('const plural')) ?? ''
+  const bindStatus = new Function('$', `${pluralLine}\n${lift(appJs, 'renderStatus')}\nreturn renderStatus`) as
+    (el: (id: string) => StubCell) => (s: { connected: boolean; online: number }) => void
+  const renderStatus = bindStatus(cell)
+
+  renderStatus({ connected: false, online: 3 })
+  const notMine = cells['use-text'].textContent
+  t('nodes online that are none of yours do not read as an answerable claude-code',
+    cells['use-status'].live === false && /none of them is yours/i.test(notMine) && /claude-code\/public/.test(notMine), notMine)
+  t('while the support view still leads with the global count on the same poll',
+    cells['status'].live === true && cells['status-text'].textContent === '3 supporters online', cells['status-text'].textContent)
+
+  renderStatus({ connected: true, online: 0 })
+  const mineUp = cells['use-text'].textContent
+  t('your own node up with nobody else online is an answered claude-code',
+    cells['use-status'].live === true && /claude-code will be answered/.test(mineUp), mineUp)
+  t('and the support view is the one that reports nobody online',
+    cells['status'].live === false && /No supporters online/i.test(cells['status-text'].textContent))
+
+  renderStatus({ connected: false, online: 0 })
+  const nothing = cells['use-text'].textContent
+  t('no node and nobody online says so, and says what to do about it',
+    cells['use-status'].live === false && /no node of your own/i.test(nothing) && /provider key/.test(nothing), nothing)
+
+  renderStatus({ connected: false, online: 1 })
+  t('the single-node wording reads as English',
+    /1 supporter online, but it is not yours/.test(cells['use-text'].textContent), cells['use-text'].textContent)
+}
 // The README quotes this line for people who never open the site. Drift there
 // hands them the phrasing that was measured to fail.
 {
@@ -843,8 +1047,57 @@ t('the pasted brief carries the same deny list as the hosted script',
     /read and accepted the supporter terms/i.test(quoted) && !/and follow it/i.test(quoted))
   t('the README no longer claims the supporter answers jobs in its own session',
     /headless `claude -p`/.test(readme))
+  // The README is the only description of the relay for anyone who never opens
+  // the site, and it described one global queue. Both halves of the split have
+  // to be there or it is selling the behaviour this branch removed.
+  t('the README covers both model strings, not just the bare one', /claude-code\/public/.test(readme))
+  t('and says the own queue is the default and the pool is the opt-in',
+    /requester's own queue/.test(readme) && /"pool":"public"/.test(readme))
+  // The containment count is the claim that rots: the flag set moved and the
+  // number in the sentence did not. Derive the list from llms.txt, which is what
+  // the shipped script actually passes, and hold the README to it in both
+  // directions - every flag present, and the number it claims equal to the
+  // number it lists.
+  const containment = [...new Set((/SAFE="([^"]+)"/.exec(llms)?.[1] ?? '').trim().split(/\s+/).filter(Boolean)), '--disallowedTools', 'timeout 120']
+  const absent = containment.filter((f) => !readme.includes(f))
+  t('the README lists every flag the shipped worker is contained by',
+    containment.length >= 6 && absent.length === 0, absent.join(', ') || `${containment.length} flags`)
+  const counts: Record<string, number> = { three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9 }
+  const claimed = /contained (\w+) ways/.exec(readme)?.[1] ?? ''
+  t('and the number it claims is the number it lists',
+    counts[claimed] === containment.length, `"${claimed}" vs ${containment.length}`)
 }
 t('the homepage points agents at /llms.txt', readFileSync(new URL('../public/index.html', import.meta.url), 'utf8').includes('/llms.txt'))
+
+// The supporter script's own argument parser decides how much a volunteer
+// spends, and it used to step two tokens at a time: a valueless flag ate the
+// name of the flag behind it, so `--own-traffic-only --max-jobs 5` set
+// own-traffic-only to the string "--max-jobs" and left the job cap at its 100
+// default. Both runs below drive the real script and are answered by its
+// startup guards, never by the network. --base leads on purpose: under the old
+// parser a later --base was swallowed too, and the script fell back to its
+// production default, so an argument test would have pointed a real node at
+// relaybee.vercel.app. The timeout is the same guard in the other direction.
+console.log('%ssupporter script - the flags that bound spend actually parse', String.fromCharCode(10))
+{
+  const { spawnSync } = await import('node:child_process')
+  const { fileURLToPath } = await import('node:url')
+  const script = fileURLToPath(new URL('../scripts/supporter.mjs', import.meta.url))
+  const runSupporter = (...args: string[]) => {
+    const r = spawnSync(process.execPath, [script, '--base', 'http://127.0.0.1:1', ...args], {
+      encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL',
+    })
+    return { code: r.status, out: (r.stderr ?? '') + (r.stdout ?? '') }
+  }
+  const contradiction = runSupporter('--own-traffic-only', '--pool', 'public')
+  t('a valueless flag no longer swallows the flag behind it',
+    contradiction.code === 1 && /contradict each other/.test(contradiction.out),
+    contradiction.out.split('\n')[0] || `exit=${contradiction.code}`)
+  const noCap = runSupporter('--own-traffic-only', '--max-jobs')
+  t('and --max-jobs with no number stops the node instead of uncapping it',
+    noCap.code === 1 && /--max-jobs is the total spend bound/.test(noCap.out),
+    noCap.out.split('\n')[0] || `exit=${noCap.code}`)
+}
 
 // A minted key is worth nothing without instructions that run. The docs page is
 // the answer to "I have a key, now what", so pin the parts a reader actually
@@ -865,6 +1118,33 @@ t('docs.js reads the key the homepage already stored', docsJs.includes("localSto
 t('the in-page tester streams, as the page tells readers to', /stream:\s*true/.test(docsJs))
 t('the homepage links to the docs page, not the repo readme', indexHtml.includes('/docs.html') && !indexHtml.includes('relaybee#readme'))
 t('docs page pulls in no third-party asset', !/https?:\/\/(?!github\.com)/.test(docsHtml))
+
+// The page sold `claude-code` as "a supporter's machine", which stopped being
+// true when the queue split: it now reaches only nodes running under the
+// reader's own key, and almost no reader of the docs has one. So the page named
+// one model, ran that model in its own demo, and 504'd for everybody it was
+// written to convince.
+t('the models table documents both relay strings',
+  /<td><code>claude-code\/public<\/code><\/td>/.test(docsHtml) && !/A supporter's machine/.test(docsHtml))
+t('and the runnable snippets send the one a stranger can answer',
+  /"model":"claude-code\/public"/.test(docsHtml) && /model: 'claude-code\/public'/.test(docsHtml))
+t('the in-page demo no longer hardcodes the own-nodes-only model',
+  /claude-code\/public/.test(docsJs) && !/model:\s*'claude-code',/.test(docsJs))
+// Which of the two it sends is decided by whether a node of the reader's own is
+// live, which is the `connected` field, not the global count. The count cannot
+// answer it: presence records every polling node and not which of them opted
+// into the shared pool.
+t('and picks between them on the reader\'s own node, not the global count',
+  /\.connected/.test(docsJs) && /function renderStatus\([a-z]+,\s*[a-z]+\)/.test(docsJs))
+t('the old promise that a count means claude-code gets answered is gone',
+  !/supporters online, so claude-code will be answered/.test(docsJs) &&
+  !/No supporters online, so claude-code has nobody to answer it right now/.test(docsJs))
+// A stranger reads whatever goes to the public pool, so the page has to name the
+// model it is about to send before the button, not after the answer comes back.
+// The note used to read "Goes to a supporter. Needs one online", which named
+// neither pool and was wrong about which one it meant.
+t('the demo names the pool it will send, next to the button',
+  /id="try-note">[^<]*claude-code\/public/.test(docsHtml) && /try-note/.test(docsJs))
 
 // Snippets are tabbed by language rather than stacked. The CSP forbids inline
 // script, so the tabs are wired by id from docs.js: a panel whose tab id does
@@ -989,17 +1269,59 @@ console.log('%srelay public pool - opt-in on both ends, or it does not happen', 
 // the 504 has to say which one it is.
 console.log('%srelay timeout copy - the message names the real problem', String.fromCharCode(10))
 {
+  // A node that is polling, and polling only for its own traffic. Global
+  // presence records it; nothing anywhere records that it is not watching the
+  // shared pool. Queue it a job of its own first so the poll returns at once
+  // instead of holding the full window.
+  const { isLive } = await import('../lib/queue.ts')
+  const ownOnlyUser = 'own_traffic_only_node'
+  const ownOnlyKey = await issueKey(ownOnlyUser)
+  await submitJob('claude-code', [{ role: 'user', content: 'warm-own-only' }], ownOnlyUser)
+  await workNext(new Request('https://x/api/work/next', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${ownOnlyKey}`, 'x-forwarded-for': '198.51.100.201' },
+  }))
+  t('the own-traffic-only node is recorded as live', await isLive(ownOnlyUser))
+
+  // Both callers wait out the same 20s buffered window, so start them together.
   const lonely = await issueKey('lonely_caller')
-  const res = await chatCompletions(new Request('https://x/api/v1/chat/completions', {
+  const lonelyRes = chatCompletions(new Request('https://x/api/v1/chat/completions', {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${lonely}` },
     body: JSON.stringify({ model: 'claude-code', messages: [{ role: 'user', content: 'anyone?' }] }),
   }))
+  await (await import('../lib/queue.ts')).markLive('own_only_bystander')
+  const stranded = await issueKey('stranded_public_caller')
+  const strandedRes = chatCompletions(new Request('https://x/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${stranded}` },
+    body: JSON.stringify({ model: 'claude-code/public', messages: [{ role: 'user', content: 'anyone at all?' }] }),
+  }))
+
+  const res = await lonelyRes
   const body = await res.json()
   t('a caller with no node of their own is told exactly that',
     res.status === 504 && /no node of your own/i.test(body.error.message), body.error.message.slice(0, 60))
   t('and is pointed at the public pool as the alternative', /claude-code[/]public/.test(body.error.message))
 
+  // The public pool cannot be answered out of a global count. Presence says
+  // somebody is polling; it does not say any of them is watching the shared
+  // queue, and this job was parked on a queue nobody was on. Telling that caller
+  // a supporter took it and to retry with stream: true is advice for a situation
+  // that is not theirs, and it costs them a second full wait to find out.
+  const pubRes = await strandedRes
+  const pubMsg = String((await pubRes.json()).error.message)
+  t('a public caller is not told a supporter took a job nobody was offered',
+    pubRes.status === 504 && !/took this and did not finish/.test(pubMsg), pubMsg.slice(0, 70))
+  t('nor pointed at streaming, which would only make the same wait longer',
+    !/"stream": true/.test(pubMsg))
+  // The decisive one. A node IS live above, it just is not watching the public
+  // pool, so the honest answer is a definite no rather than a hold. Before the
+  // opt-in was recorded per pool this read "may have been offered to nobody".
+  t('a live own-only node does not read as capacity for the public pool',
+    /watching the public pool/i.test(pubMsg), pubMsg.slice(0, 90))
+  t('and the caller is told how to get an answer instead',
+    /drop the "[/]public" suffix/.test(pubMsg), pubMsg.slice(0, 110))
 }
 // GET /api/v1/models feeds model pickers, so every id it hands out has to be one
 // the router will actually accept. It used to list provider names, which are the
@@ -1013,11 +1335,36 @@ console.log('\nmodels - every advertised id is one the router accepts')
   const body = (await res.json()) as { data: Array<{ id: string; object: string }>; providers: Array<{ id: string }> }
   t('the list is not empty', body.data.length > 0, `${body.data.length}`)
   t('every entry is typed as a model', body.data.every((m) => m.object === 'model'))
+  // Two relay ids, because they are different capacity. "claude-code" reaches
+  // only nodes running under the caller's own key, so a list carrying it alone
+  // hands every caller without a node of their own the one id guaranteed to time
+  // out for them, and hides the only id that reaches anyone else's machine.
+  const isRelayId = (id: string) => id === 'claude-code' || id === 'claude-code/public'
+  t('the shared pool is advertised too, not only the caller\'s own nodes',
+    body.data.some((m) => m.id === 'claude-code/public'), body.data.map((m) => m.id).join(', '))
+  // route() is null for both relay ids by design: the relay is dispatched before
+  // route() is ever called. So this list is the one place the two spellings can
+  // drift away from what the router accepts.
   t(
-    'every advertised id routes or is the relay model',
-    body.data.every((m) => m.id === 'claude-code' || Boolean(route(m.id))),
+    'every advertised id routes or is a relay id',
+    body.data.every((m) => isRelayId(m.id) || Boolean(route(m.id))),
     body.data.map((m) => m.id).join(', '),
   )
+  // The direction that pins the contract rather than restating it: put every
+  // advertised id back through the gateway and assert none is rejected as
+  // unknown. An empty message is the cheap probe, since it clears model dispatch
+  // and stops at the next check, so no relay wait is spent proving a string routes.
+  const unknownToTheGateway: string[] = []
+  for (const m of body.data) {
+    const probe = await chatCompletions(new Request('https://x/api/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${listKey}`, 'x-forwarded-for': '198.18.0.21' },
+      body: JSON.stringify({ model: m.id, messages: [{ role: 'user', content: '' }] }),
+    }))
+    if (/Unknown model/.test((await probe.json()).error?.message ?? '')) unknownToTheGateway.push(m.id)
+  }
+  t('and the gateway accepts every one of them in "model"',
+    unknownToTheGateway.length === 0, unknownToTheGateway.join(', ') || `${body.data.length} checked`)
   t('a bare provider name is NOT advertised as a model', !body.data.some((m) => m.id in ADAPTERS))
   t('the providers are still reported, separately', body.providers.length === Object.keys(ADAPTERS).length)
 
@@ -1084,7 +1431,14 @@ console.log('%slimits - the caps count what they say they count', String.fromCha
   const cjkRes = await chatCompletions(new Request('https://x/api/v1/chat/completions', {
     method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${limitKey}` }, body: cjkBody,
   }))
-  t('and it is refused on bytes, not characters', cjkRes.status === 400, `status=${cjkRes.status}`)
+  // A 400 on its own does not test the fix. This body is also far over the
+  // relay's own 32KB message cap, which counted bytes correctly all along, so
+  // the character-counting body cap waved it through and the relay refused it
+  // one step later with the same status and the same CORS envelope. The only
+  // thing that tells the two rejections apart is which cap the message names.
+  const cjkMsg = String((await cjkRes.json()).error.message)
+  t('and it is refused on bytes, not characters',
+    cjkRes.status === 400 && /body too large/i.test(cjkMsg) && !/for the relay/i.test(cjkMsg), cjkMsg)
 }
 
 // The job trim decides a caller has given up. It has to outlast the longest

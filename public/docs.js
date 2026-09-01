@@ -146,21 +146,36 @@ $('btn-mint').addEventListener('click', async (e) => {
 const STATUS_POLL_MS = 10_000
 let statusTimer = null
 let online = 0
+let connected = false
 
-function renderStatus(n) {
+// The light and the count answer different questions, because a job goes to its
+// requester's own queue. "claude-code" is served only by nodes running under this
+// same key, so `connected` is the whole answer for it. The global count is an
+// upper bound on "claude-code/public" rather than a promise: this page polls the
+// global count, and only some of those nodes opted into the shared pool.
+function renderStatus(n, mine) {
   online = n
+  connected = mine
   const box = $('status')
-  box.classList.toggle('live', n > 0)
-  $('status-text').textContent = n > 0
-    ? `${n} supporter${n === 1 ? '' : 's'} online, so claude-code will be answered`
-    : 'No supporters online, so claude-code has nobody to answer it right now'
+  box.classList.toggle('live', mine || n > 0)
+  $('status-text').textContent = mine
+    ? 'A node of your own is online, so claude-code is answered on your machine'
+    : n > 0
+      ? `No node of your own, so claude-code has nobody. ${n} node${n === 1 ? '' : 's'} online in total, and claude-code/public reaches whichever of them opted in`
+      : 'Nothing is online, so neither claude-code nor claude-code/public has anybody to answer it'
+  $('try-note').textContent = mine
+    ? 'Goes to your own node, as claude-code.'
+    : 'No node of your own, so this sends claude-code/public and a stranger answers it.'
 }
 
 async function pollStatus() {
   if (!relaybeeKey) return
   try {
     const res = await fetch(origin + '/api/work/status', { headers: { authorization: `Bearer ${relaybeeKey}` } })
-    if (res.ok) renderStatus(Number((await res.json()).online) || 0)
+    if (res.ok) {
+      const status = await res.json()
+      renderStatus(Number(status.online) || 0, Boolean(status.connected))
+    }
   } catch { /* transient, the next tick retries */ }
 }
 
@@ -184,6 +199,14 @@ document.addEventListener('visibilitychange', () => {
 // Streaming, for the reason the page gives: a buffered relay request has to give
 // up at 20s to stay inside the platform's initial-response deadline, and real
 // supporter answers routinely take longer than that.
+//
+// The model string picks the queue, so this is also where the demo either works
+// or does not. Plain "claude-code" reaches only nodes running under the reader's
+// own key, which almost no reader visiting the docs has, so it would sit out the
+// whole streaming window and 504 for everybody the page is meant to convince. It
+// falls back to the public pool, and the page and the note say so before Send.
+const tryModel = () => (connected ? 'claude-code' : 'claude-code/public')
+
 async function runTry() {
   const btn = $('btn-try')
   const out = $('try-out')
@@ -192,15 +215,18 @@ async function runTry() {
   if (!relaybeeKey) { show(out, 'Mint a key first.', true); return }
   if (!prompt) { show(out, 'Type a prompt first.', true); return }
 
+  const model = tryModel()
   btn.disabled = true
-  show(out, online > 0 ? 'Waiting for a supporter to answer…' : 'Sending. No supporter is showing as online, so this may time out…', false)
+  show(out, connected || online > 0
+    ? `Waiting for an answer to ${model}…`
+    : `Sending ${model}. Nothing is showing as online, so this may time out…`, false)
 
   try {
     const res = await fetch(origin + '/api/v1/chat/completions', {
       method: 'POST',
       headers: { authorization: `Bearer ${relaybeeKey}`, 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-code',
+        model,
         stream: true,
         messages: [{ role: 'user', content: prompt }],
       }),
