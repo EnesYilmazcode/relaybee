@@ -607,6 +607,54 @@ t('connect: a forced error returns a clean 500', connectErr.status === 500)
 t('connect: the error path keeps CORS', connectErr.headers.get('access-control-allow-origin') === '*')
 t('connect: the error path carries a {message,type} envelope', typeof connectErrJson.error?.message === 'string' && typeof connectErrJson.error?.type === 'string')
 
+console.log('\npublic pool — one caller cannot take a volunteer\'s whole allowance')
+// The general limit meters a caller against Relaybee's quota. A public-pool job
+// spends a volunteer's API key instead, which is why it needs its own smaller
+// budget. Drive the bucket to its edge first: the cap is charged before the job
+// is queued, so a refused call returns at once instead of holding the relay's
+// 20s window open, and the test costs no wall-clock.
+{
+  const { check, PUBLIC_POOL_LIMIT, LIMITS } = await import('../lib/ratelimit.ts')
+  const capUser = 'pool_cap_user'
+  const capKey = await issueKey(capUser)
+  const publicReq = () => new Request('https://x/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${capKey}` },
+    body: JSON.stringify({ model: 'claude-code/public', messages: [{ role: 'user', content: 'cap' }] }),
+  })
+
+  t('the public pool is capped well below the general limit', PUBLIC_POOL_LIMIT < LIMITS.free,
+    `public=${PUBLIC_POOL_LIMIT} general=${LIMITS.free}`)
+
+  // Spend the caller's public budget without going through the handler, so the
+  // assertion below is about the cap and not about queue timing.
+  check(`public:${capUser}`, PUBLIC_POOL_LIMIT, PUBLIC_POOL_LIMIT)
+  const refused = await chatCompletions(publicReq())
+  t('a caller over the public-pool budget is refused', refused.status === 429, `status=${refused.status}`)
+  const refusedBody = await refused.json()
+  t('and told to use their own node instead, which is the un-capped path',
+    /claude-code/.test(refusedBody.error?.message ?? '') && refusedBody.error?.type === 'rate_limit_error')
+  t('the refusal carries rate-limit headers a client can read',
+    refused.headers.get('x-ratelimit-limit') === String(PUBLIC_POOL_LIMIT))
+
+  // The cap is on the public pool alone: a caller's own node is their own spend,
+  // so exhausting the public budget must not close the path they actually own.
+  // Driven through the real handler with a node of their own answering, because
+  // the claim is about the handler's routing and reading a bucket would not test
+  // it. The node earns its keep twice: with nobody answering, this call holds the
+  // relay's 20s window open, which is 20s on every run of the gate.
+  const capSupporter = await issueKey(capUser)
+  const ownReq = chatCompletions(new Request('https://x/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${capKey}` },
+    body: JSON.stringify({ model: 'claude-code', messages: [{ role: 'user', content: 'own-after-cap' }] }),
+  }))
+  const cycled = await supporterCycle(undefined, capSupporter, 'own')
+  const ownAfter = await ownReq
+  t('and the caller\'s own pool still answers after the public budget is gone',
+    ownAfter.status === 200, `status=${ownAfter.status} node=${cycled.polled}`)
+}
+
 console.log('\nCORS — the capability endpoints answer named origins, not everyone')
 // /api/keys/issue is an unauthenticated simple POST, so a wildcard let any page
 // a visitor loaded mint a key in their browser and poll the relay from their IP,
@@ -889,6 +937,14 @@ t('the worker removes the MCP and skill surface rather than listing it',
 // auto-approved a CronCreate from a stranger's prompt.
 t('a single job cannot wedge the node', /timeout 120 claude/.test(llms))
 t('each job has a spend ceiling', /--max-budget-usd/.test(llms))
+// Grepping for the flag name leaves the number free to change without anything
+// noticing, and PROJECT.md quotes these two figures as what a volunteer is
+// agreeing to. Pin the values, so moving one is a deliberate edit to the board
+// and the test together rather than a silent change to somebody's bill.
+t('and the per-job ceiling is the 0.50 the board quotes', /--max-budget-usd 0\.50\b/.test(llms))
+t('and the job-count default is the 100 the board quotes', /RELAYBEE_MAX_JOBS:-100\}/.test(llms))
+t('and the count is enforced by the loop, not merely stated',
+  /\$DONE.*-ge.*\$MAXJOBS/s.test(llms) && /break/.test(llms))
 // A per-job cap with no total is still an unbounded commitment, and every
 // Sonnet trial against the hardened file stopped to say so before running it.
 // The loop stops itself after MAXJOBS, so the spend a supporter agrees to is

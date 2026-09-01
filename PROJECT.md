@@ -108,6 +108,7 @@ existence.
 | 85 | Two more assertions that could not fail made real, bringing the round's total of vacuous checks to six | `test` (#100) |
 | 86 | `SECURITY.md` and `lib/queue.ts` stopped calling the job id the capability, which the ticket replaced | `docs` (#100) |
 | 87 | The endpoints that hand back a key or a job answer named origins instead of `*`, so a page a visitor loads can no longer read a minted key out of their browser | `fix(web)` (#101) |
+| 88 | The public pool is capped per caller, so one stranger cannot claim a volunteer's whole allowance, and the two spend figures the board quotes are pinned rather than grepped for | `fix(relay)` (#103) |
 
 ### Resolved: Relaybee is a personal capacity router
 
@@ -162,12 +163,11 @@ neither survives. Recorded here because the issue is the wrong place to look for
   `test/smoke.mts:891,897,1048` are substring greps for `--max-budget-usd`, `MAXJOBS` and the
   words "Stop after 100 jobs". Neither number is asserted, so raising either one keeps
   `npm run check` green.
-  **The server-side cap the issue actually asked for does not exist**, and the harm it named is
-  live: a caller can still submit 20 jobs a minute (`lib/ratelimit.ts:61`) into one shared
-  `PUBLIC_QUEUE` with no per-caller fairness (`lib/queue.ts:54,369`), and minting is free
-  (`lib/ratelimit.ts:91`). The server does meter, but it meters *rate*, not *total*:
-  `IP_POLL_LIMIT` and `IP_COMPLETE_LIMIT` bound how fast a node is handed and can return work.
-  Nothing server-side bounds how much work a volunteer is offered in total.
+  **The server-side cap the issue asked for did not exist when this was decided, and now does**
+  (#103): `PUBLIC_POOL_LIMIT` is four public-pool jobs a minute per caller, metered on the key
+  and on the source, charged before the job is queued. It bounds how much of a stranger's budget
+  one caller can claim, which is the half no volunteer can enforce for themselves. It does not
+  bound total spend, and is not meant to: the node-side bounds stay the ceiling there.
   The third prerequisite, an Upstash plan fitting more than one supporter, is untouched.
 
 **What the decision actually accepts.** The one leg still standing is the third: answering
@@ -181,10 +181,11 @@ is accepted rather than solved: real `claude -p` answers ranged from 4s to 283s 
 streaming ceiling, so a volunteer pays for some answers that arrive too late to be delivered.
 #59 moved that ceiling a long way and cannot remove it.
 
-**Still open, and deliberately not built.** A per-caller cap on the public pool. One caller can
-take a volunteer's whole job allowance, and on the pasted-brief path nothing but an instruction
-stops the loop at all. This is the one piece of option A that a decision to keep the pool does
-not settle, so it stays on the board rather than being written off.
+**Built straight after, in #103.** The per-caller cap on the public pool was the one piece of
+option A that keeping the pool did not settle, so it did not stay on the board long. One caller
+could take a volunteer's whole job allowance. What is still true and is accepted: on the
+pasted-brief path the job count is an instruction to an agent rather than a loop that stops, so
+a volunteer's total is only as firm as the agent following it.
 
 ### Future products (explicitly separate, each with its real cost)
 
@@ -372,10 +373,11 @@ Settled on #76. Self-relay is the default and is what `claude-code` means; answe
 needs `claude-code/public` from the caller and `{"pool":"public"}` from the node. Kept rather
 than deleted because the terms objection that killed the original design is answered for the
 default path by construction, and what remains is a disclosed risk a volunteer opts into twice.
-Do not read this as "the spend question is closed": the per-caller cap on the public pool is
-still open, and the volunteer-side bounds are defaults on the node, not limits the service
-imposes. If the pool ever has more than a node or two in it, that cap is the thing to build
-before anything else.
+Do not read this as "the spend question is closed". The per-caller cap that was open here was
+built as #103, but it is a fairness bound, not a spend one: it limits how much of a volunteer's
+budget any single caller can claim, and nothing server-side bounds a volunteer's total. That
+ceiling is still a default on their own machine, and on the pasted-brief path it is prose an
+agent is asked to obey rather than a loop that stops.
 
 **2026-07-30 · Personal capacity router, not a marketplace.**
 Settled by a five-perspective design review (`docs/design/2026-07-30-dashboard-panel.md`).

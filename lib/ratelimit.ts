@@ -61,6 +61,23 @@ export function check(userId: string, limit: number, cost = 1): Verdict {
 export const LIMITS: Record<string, number> = { free: 20 }
 
 /**
+ * Public-pool submissions, per caller, per minute.
+ *
+ * `LIMITS.free` meters a caller against Relaybee's own invocation quota. This
+ * meters them against a *volunteer's* API bill, which is a different budget and
+ * a far smaller one, so it cannot be the same number. A node answers serially
+ * and measured answers ran 4s to 283s, so one caller sending 20 a minute
+ * oversubscribes any single supporter by an order of magnitude and can spend
+ * their whole job allowance before anyone else is served.
+ *
+ * Four still exceeds what one node can work through in a minute, so it does not
+ * constrain honest use; it bounds how much of a stranger's budget one caller
+ * can claim. The node-side bounds stay the real ceiling on total spend. This is
+ * the fairness half, which is the half no volunteer can enforce for themselves.
+ */
+export const PUBLIC_POOL_LIMIT = 4
+
+/**
  * Best-effort client IP, for limits that must survive key rotation.
  *
  * Metering on user id alone is bypassable here: /api/keys/issue is unauthenticated
