@@ -4,10 +4,12 @@ Living status doc. Updated in the same commit as the change it describes, so the
 stale relative to the code. Newest entries at the top of each log.
 
 **Status:** deployed, and the relay is verified end to end on production rather than only in local
-tests. `feat/relay-private-pools` is green on the full gate and ready to go in as one
-fast-forward, which is the owner's call because merging ships. Three things want a decision:
-the relay's direction (P0 in Next, and two of its three legs have moved), whether to rotate
-`MASTER_SECRET` over a key this branch leaked, and the two orphan branches below.
+tests. The private-pools round landed as #100 and the CORS allowlist as #101, so `main` carries
+both and there is no branch waiting to go in. The relay's direction is decided (see the #76
+section below: the public pool stays, opt-in and empty by default). **One thing still wants a
+decision: whether to rotate `MASTER_SECRET` over the key leaked in `test_ascii_art.py`.** That
+key is valid until 2026-10-31 and rotation is the only lever, which invalidates every key in
+existence.
 **Live URL:** https://relaybee.vercel.app
 **Last updated:** 2026-09-01
 
@@ -124,10 +126,49 @@ unanimous: **personal capacity router.** Both supporter mechanisms are dead as p
   risk a ban. It also cannot fit Vercel Hobby function lifetimes or Upstash's free tier.
   Salvage: **self-relay** — your own idle machine serving your own pool — as a future mode of
   the npm package.
+  **The salvage shipped, and it is the default.** `claude-code` now routes to a node running
+  under the caller's own key, so the shape the licensing objection never covered is the one a
+  caller gets by default (#100). Answering strangers survives as `claude-code/public`, opt-in on
+  both ends and empty unless somebody joins it. See the #76 decision below.
 
 What replaces "supporters": sharing with people you know goes through the provider, not through
 Relaybee — invite them into your Anthropic/OpenAI organization so they hold their own key and seal
 their own blob. That is the one sharing mechanism provider terms are built to permit.
+
+### Decided: the public pool stays, opt-in and empty by default (2026-09-01)
+
+[#76](https://github.com/EnesYilmazcode/relaybee/issues/76) asked whether to keep promoting the
+relay, demote it, build self-relay, or delete it. **Decision: keep it, as it now stands.** The
+default path is self-relay, answering strangers is a suffix a caller and a node both have to
+choose, and nobody is in the shared pool until somebody joins it.
+
+The issue's four options were written against a global queue and a supporter-led homepage, and
+neither survives. Recorded here because the issue is the wrong place to look for what is true:
+
+- **Option C, "build real self-relay", is done.** The issue calls it unavailable because "the
+  queue is global and `nextJob` hands any job to any poller". `submitJob` takes an owner and a
+  pool, queues are per requester, and `claude-code` means a node under the caller's own key
+  (#100). The salvage the design review blessed is the default.
+- **Option B, "demote it", is substantially done.** `public/index.html` renders
+  `<section id="view-support" hidden>`; the page opens on the key box and Support is a toggle.
+  The homepage has not led with the supporter pitch since the redesign.
+- **Option A's prerequisite, "a spend cap on the `claude-code` path", already exists**, and not
+  where the issue looked for it. The server-side limit meters the *caller*; a volunteer's
+  exposure is bounded on their own node, which is the only place that can know their budget.
+  Both onboarding paths cap a single job at `--max-budget-usd 0.50` and stop the loop after 100
+  jobs, and `test/smoke.mts` asserts both on the pasted brief and the hosted script.
+
+**What the decision actually accepts.** The one leg still standing is the third: answering
+anonymous third parties on your own API key is the kind of API-access sharing commercial terms
+restrict, and `--bare` does not touch that. It applies to the public pool alone. That risk is
+disclosed in `public/llms.txt`, which is the file an agent reads before it runs anything, and it
+is carried by a volunteer who opted in twice. The infrastructure leg is unchanged and accepted
+for the same reason: the free Upstash tier fits roughly one continuous supporter, and one is the
+expected number when the pool is empty by default.
+
+**Still open, and deliberately not built.** A single caller can spend a volunteer's whole 100-job
+allowance. That is fairness rather than spend, since the total is bounded either way, and it only
+bites if the public pool ever has someone in it.
 
 ### Future products (explicitly separate, each with its real cost)
 
@@ -201,6 +242,9 @@ against `main` is 25 lines added and 170 removed across `api/health.ts`, `api/wo
 shipped items 56 and 66 wearing a script fix's name, so merging it on the strength of its
 commit messages would silently take back the `s-maxage` header on `/api/health`, the
 one-command presence count, and the tests that assert both. Delete both branches.
+**Done (2026-09-01): both branches are deleted and neither exists on the remote.** The reasoning
+stays because the second one is the kind of trap worth recognising again: three commit messages
+about a file the diff never touches.
 
 ### The adversary suite
 
@@ -282,7 +326,6 @@ time it ran, on a branch that was missing #89.
 
 | Priority | Item | Why |
 |---|---|---|
-| P0 | **Decide the relay's direction** ([#76](https://github.com/EnesYilmazcode/relaybee/issues/76)) | **The premise moved on 2026-09-01, so decide against the current facts rather than the ones in the issue.** Its "dead on terms grounds" verdict stood on three legs and two are gone. (1) *A node bills a consumer seat.* Both onboarding paths are now API-billed by construction: the hosted `llms.txt` script and the pasted homepage brief both pass `--bare`, which reads `ANTHROPIC_API_KEY` and never the login or keychain, and both stop rather than start a node without one. (2) *A node serves strangers.* It does not, unless it opts in. A job goes to its requester's own queue, so a node polling under your key is only offered jobs sent under that same key; answering anyone else means sending `{"pool":"public"}`, and the only route into that on a shipped path is `RELAYBEE_POOL=public` set by hand before the hosted script runs, which the script's own text tells the agent never to set for you. The leg still standing is the third and it is the one to actually decide: a trial read answering anonymous third parties on your own API key as the kind of sharing of API access commercial terms restrict, and that objection survives `--bare`. It now applies to the public pool only. The measurements are on the issue: the free tier fits about one supporter, and real answers ranged from 4s to 283s against a 110s ceiling |
 | P1 | End-to-end test with a **real** provider key | The largest unverified claim in the repo. The live chain reaches Anthropic and returns a real `request_id`, but no successful completion has ever come back, and `test/e2e.mts` mocks the upstream, so the Anthropic response parsing is only ever checked against a fake written from the docs. One minute and about two cents: `node scripts/verify-provider.mjs` |
 | P1 | npm client package | Mint/seal/compose-config from the terminal, mirroring the setup page. Design so a self-relay mode can be added later |
 | P2 | Retry budget per request | One bad pool of 8 blobs currently costs 8 upstream calls |
@@ -412,6 +455,29 @@ Honest list. None of these are bugs; all are consequences of choices above.
 ---
 
 ## Changelog
+
+### 2026-09-01 (the relay's direction, decided against the facts rather than the issue's)
+
+[#76](https://github.com/EnesYilmazcode/relaybee/issues/76) was the last P0 and it was a decision,
+not a task. Decided: **keep the public pool, opt-in on both ends and empty by default.** The full
+reasoning is in the Decided section above.
+
+Worth recording separately is that three of the four options in the issue could not be chosen as
+written, because the code moved under them and nobody updated the issue. Option C, "build real
+self-relay", was already shipped and is the default. Option B, "demote the supporter framing",
+was already substantially done: the homepage has not opened on the supporter view since the
+redesign. And option A's stated prerequisite, a spend cap, already existed on both onboarding
+paths, per job and in total.
+
+That last one is the useful lesson. The cap was looked for in the server's rate limiter and is
+not there, because the server meters the caller, not the volunteer. A volunteer's exposure is
+bounded on their own node, which is the only place that knows their budget: `--max-budget-usd
+0.50` per job and a 100-job stop on the loop, on both the hosted script and the pasted brief,
+with assertions on both. Reading the limiter alone and concluding "uncapped" is the wrong
+conclusion from the right file.
+
+The board carried this as an open P0 for a month while two of its four options quietly became
+done. Nothing was broken by it, but the Next table is supposed to be the thing that is true.
 
 ### 2026-09-01 (the endpoints that hand back a capability stopped answering every origin)
 
