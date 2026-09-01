@@ -152,11 +152,23 @@ neither survives. Recorded here because the issue is the wrong place to look for
 - **Option B, "demote it", is substantially done.** `public/index.html` renders
   `<section id="view-support" hidden>`; the page opens on the key box and Support is a toggle.
   The homepage has not led with the supporter pitch since the redesign.
-- **Option A's prerequisite, "a spend cap on the `claude-code` path", already exists**, and not
-  where the issue looked for it. The server-side limit meters the *caller*; a volunteer's
-  exposure is bounded on their own node, which is the only place that can know their budget.
-  Both onboarding paths cap a single job at `--max-budget-usd 0.50` and stop the loop after 100
-  jobs, and `test/smoke.mts` asserts both on the pasted brief and the hosted script.
+- **Option A listed three prerequisites, and the spend cap is the one still genuinely open.**
+  Be precise about it, because it is easy to read the volunteer-side bounds as satisfying it and
+  they do not. What exists is on the node: `--max-budget-usd 0.50` on a single job, and a job
+  count that stops the loop. Those are the volunteer's own bounds, self-imposed and overridable
+  (`RELAYBEE_MAX_JOBS` changes the count), and they are not equally real on the two paths:
+  `public/llms.txt:139,231` enforces the count in the loop, while the pasted brief carries it as
+  prose at step 4 telling an agent to stop, with nothing enforcing it. The gate is weaker still:
+  `test/smoke.mts:891,897,1048` are substring greps for `--max-budget-usd`, `MAXJOBS` and the
+  words "Stop after 100 jobs". Neither number is asserted, so raising either one keeps
+  `npm run check` green.
+  **The server-side cap the issue actually asked for does not exist**, and the harm it named is
+  live: a caller can still submit 20 jobs a minute (`lib/ratelimit.ts:61`) into one shared
+  `PUBLIC_QUEUE` with no per-caller fairness (`lib/queue.ts:54,369`), and minting is free
+  (`lib/ratelimit.ts:91`). The server does meter, but it meters *rate*, not *total*:
+  `IP_POLL_LIMIT` and `IP_COMPLETE_LIMIT` bound how fast a node is handed and can return work.
+  Nothing server-side bounds how much work a volunteer is offered in total.
+  The third prerequisite, an Upstash plan fitting more than one supporter, is untouched.
 
 **What the decision actually accepts.** The one leg still standing is the third: answering
 anonymous third parties on your own API key is the kind of API-access sharing commercial terms
@@ -164,11 +176,15 @@ restrict, and `--bare` does not touch that. It applies to the public pool alone.
 disclosed in `public/llms.txt`, which is the file an agent reads before it runs anything, and it
 is carried by a volunteer who opted in twice. The infrastructure leg is unchanged and accepted
 for the same reason: the free Upstash tier fits roughly one continuous supporter, and one is the
-expected number when the pool is empty by default.
+expected number when the pool is empty by default. The third measured cost travels with them and
+is accepted rather than solved: real `claude -p` answers ranged from 4s to 283s against a 110s
+streaming ceiling, so a volunteer pays for some answers that arrive too late to be delivered.
+#59 moved that ceiling a long way and cannot remove it.
 
-**Still open, and deliberately not built.** A single caller can spend a volunteer's whole 100-job
-allowance. That is fairness rather than spend, since the total is bounded either way, and it only
-bites if the public pool ever has someone in it.
+**Still open, and deliberately not built.** A per-caller cap on the public pool. One caller can
+take a volunteer's whole job allowance, and on the pasted-brief path nothing but an instruction
+stops the loop at all. This is the one piece of option A that a decision to keep the pool does
+not settle, so it stays on the board rather than being written off.
 
 ### Future products (explicitly separate, each with its real cost)
 
@@ -180,12 +196,14 @@ Not features of this codebase. If either is ever pursued, it is a new commitment
   fixes licensing entirely, but needs a persistent broker, paid hosting, and a disclosed
   plaintext trust model. Effectively a re-platforming that reuses the adapter pattern.
 
-### Ready to merge, as one fast-forward (decided 2026-09-01)
+### Landed as one fast-forward (merged 2026-09-01)
 
-Everything below is on one branch, `feat/relay-private-pools`, which is
+Everything below went in on one branch, `feat/relay-private-pools`, which was
 [#100](https://github.com/EnesYilmazcode/relaybee/pull/100): the merge of the
 individually-reviewable PRs plus the relay isolation work that came out of attacking
-the service. Merging to `main` ships to production, so it is the owner's call.
+the service. It is on `main` as `c104bbd` and the branch is deleted. The argument for
+merging it as one commit is kept below, because it is the reasoning that produced the
+shape of the history rather than a decision still waiting to be taken.
 
 The single most important item, and the reason to look at this at all:
 
@@ -212,13 +230,13 @@ The single most important item, and the reason to look at this at all:
 | [#90](https://github.com/EnesYilmazcode/relaybee/pull/90) | CSP as a response header, not only three meta tags |
 | [#92](https://github.com/EnesYilmazcode/relaybee/pull/92) | Typecheck the tests, and hold the docs to a measured number |
 
-**The nine land together, as one fast-forward, and the table above is the record of what is
-in it.** `main` is a strict ancestor of this branch, so the merge moves a pointer and the tree
-that reaches production is byte for byte the tree the gate was run against. That property is
-the whole argument, and merging the nine separately gives it up for a different tree that
-nothing has ever run.
+**The nine landed together, as one fast-forward, and the table above is the record of what is
+in it.** `main` was a strict ancestor of the branch, so the merge moved a pointer and the tree
+that reached production was byte for byte the tree the gate had run against. That property was
+the whole argument, and merging the nine separately would have given it up for a different tree
+that nothing had ever run.
 
-Two things go wrong on the separate path. Seven of the nine touch `test/smoke.mts`, so it is a
+Two things would have gone wrong on the separate path. Seven of the nine touch `test/smoke.mts`, so it is a
 seven-way conflict, already resolved once on this branch, in a file where block order carries
 meaning: later checks reuse keys, nodes and sealed blobs that earlier blocks set up, so a
 resolution that merges cleanly can still assert against the wrong state. And the sequence
@@ -327,7 +345,7 @@ time it ran, on a branch that was missing #89.
 | Priority | Item | Why |
 |---|---|---|
 | P1 | End-to-end test with a **real** provider key | The largest unverified claim in the repo. The live chain reaches Anthropic and returns a real `request_id`, but no successful completion has ever come back, and `test/e2e.mts` mocks the upstream, so the Anthropic response parsing is only ever checked against a fake written from the docs. One minute and about two cents: `node scripts/verify-provider.mjs` |
-| P1 | npm client package | Mint/seal/compose-config from the terminal, mirroring the setup page. Design so a self-relay mode can be added later |
+| P1 | npm client package | Mint/seal/compose-config from the terminal, mirroring the setup page. The self-relay routing itself shipped in #100 and is what `claude-code` already means; what is missing is the terminal-side wrapper, so design for that rather than for the routing |
 | P2 | Retry budget per request | One bad pool of 8 blobs currently costs 8 upstream calls |
 | P2 | Record the demo clip for the post | Failover across your own providers — show two keys, kill one |
 | P3 | GitHub OAuth key recovery | **Demoted 2026-08-01.** Its stated justification does not survive the code. The reason given was that a lost key orphans every AAD-bound blob, but user ids are generated randomly at mint time (`api/keys/issue.ts`, `${clean}_${randomUUID}`) and blobs are sealed to that id, so an OAuth-derived id is a different id and opens none of them. It could only help someone who arrived through OAuth on their first ever mint, and there are none. The mechanism stays pre-agreed if identity is ever forced |
@@ -348,6 +366,16 @@ project — revisit only if this stops being a demo.
 ## Decision log
 
 Why things are the way they are, so a future change doesn't quietly undo a deliberate choice.
+
+**2026-09-01 · The public pool stays, opt-in on both ends and empty by default.**
+Settled on #76. Self-relay is the default and is what `claude-code` means; answering strangers
+needs `claude-code/public` from the caller and `{"pool":"public"}` from the node. Kept rather
+than deleted because the terms objection that killed the original design is answered for the
+default path by construction, and what remains is a disclosed risk a volunteer opts into twice.
+Do not read this as "the spend question is closed": the per-caller cap on the public pool is
+still open, and the volunteer-side bounds are defaults on the node, not limits the service
+imposes. If the pool ever has more than a node or two in it, that cap is the thing to build
+before anything else.
 
 **2026-07-30 · Personal capacity router, not a marketplace.**
 Settled by a five-perspective design review (`docs/design/2026-07-30-dashboard-panel.md`).
@@ -469,12 +497,17 @@ was already substantially done: the homepage has not opened on the supporter vie
 redesign. And option A's stated prerequisite, a spend cap, already existed on both onboarding
 paths, per job and in total.
 
-That last one is the useful lesson. The cap was looked for in the server's rate limiter and is
-not there, because the server meters the caller, not the volunteer. A volunteer's exposure is
-bounded on their own node, which is the only place that knows their budget: `--max-budget-usd
-0.50` per job and a 100-job stop on the loop, on both the hosted script and the pasted brief,
-with assertions on both. Reading the limiter alone and concluding "uncapped" is the wrong
-conclusion from the right file.
+Option A is the one to be careful with, and the first write-up of this entry got it wrong twice
+before an adversarial review caught it. Volunteer-side bounds do exist: `--max-budget-usd 0.50`
+on a job, and a job count that stops the loop. They are not the cap the issue asked for. They are
+defaults on the volunteer's own machine, overridable by `RELAYBEE_MAX_JOBS`, enforced in the
+hosted script's loop but only *stated* in the pasted brief, and pinned by substring greps that
+assert neither number. The server-side cap option A named does not exist, and the harm it named
+is live: a caller can put 20 jobs a minute into one shared public queue that has no per-caller
+fairness. The server meters rate, not total.
+
+The lesson is the shape of the mistake rather than the fact. "There is a cap" and "the cap the
+issue asked for exists" are different claims, and the first was used to retire the second.
 
 The board carried this as an open P0 for a month while two of its four options quietly became
 done. Nothing was broken by it, but the Next table is supposed to be the thing that is true.
