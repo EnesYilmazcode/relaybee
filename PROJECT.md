@@ -367,6 +367,21 @@ project — revisit only if this stops being a demo.
 
 Why things are the way they are, so a future change doesn't quietly undo a deliberate choice.
 
+**2026-09-01 · A reply is not proof the agent spoke.**
+Both supporter ports decided the agent had answered by looking at `.result`. A failed run uses the
+SAME envelope as a good one: a revoked key, an empty balance or a 429 arrives as subtype "success"
+with `is_error: true` and the provider error text sitting in `.result` where the answer goes, while
+the error subtypes carry `.errors` and no `.result` at all. So the startup probe passed, the node
+started, took jobs off the queue, and handed every caller the CLI error message while
+`/api/work/status` reported it connected. The probe comment had named exactly this failure and then
+tested the wrong thing, which is why it survived: it reads as covered.
+
+Five places now read the error flag rather than the length of a string: the startup probe, the answer
+path, the Node port’s `parseAgent`, the protocol section for anyone writing their own worker, and the
+pasted brief on the homepage. A node whose key dies mid-run delivers the job it already took, since
+taking it removed it from the queue, then stops rather than working through the queue answering
+everyone with the same error.
+
 **2026-09-01 · The public pool stays, opt-in on both ends and empty by default.**
 Settled on #76. Self-relay is the default and is what `claude-code` means; answering strangers
 needs `claude-code/public` from the caller and `{"pool":"public"}` from the node. Kept rather

@@ -28,6 +28,7 @@ import { spawn } from 'node:child_process'
 import { mkdtemp, appendFile, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 // Naming every built-in tool, including ones answering a chat never needs. The
 // deny list only blocks what it names, which is why it is the weakest of the
@@ -107,9 +108,21 @@ function agentArgs() {
  * that stopped emitting this shape would otherwise turn every answer into a
  * parse error, and an answer without accounting still serves the caller.
  */
-function parseAgent(raw) {
+export function parseAgent(raw) {
   try {
     const j = JSON.parse(raw)
+    // A failed run uses the same envelope as a good one. A revoked key or an
+    // empty balance arrives as subtype "success" with is_error true and the
+    // provider's error text in .result, and the error subtypes carry .errors
+    // with no .result at all. So .result being a string proves nothing. Null
+    // subtype counts as success, matching the shell port's (.subtype//"success").
+    if (j?.type === 'result' && (j.is_error === true || (j.subtype ?? 'success') !== 'success')) {
+      const why = (typeof j.result === 'string' && j.result.length > 0 ? j.result : null)
+        ?? (Array.isArray(j.errors) ? j.errors[0] : null)
+        ?? (j.subtype !== 'success' ? j.subtype : null)
+        ?? 'the run reported an error but gave no message'
+      throw new AgentFailed(String(why))
+    }
     if (typeof j?.result === 'string') {
       return {
         text: j.result.trim(),
@@ -122,9 +135,20 @@ function parseAgent(raw) {
           : undefined,
       }
     }
-  } catch { /* not the JSON envelope, so use it as-is */ }
+  } catch (e) {
+    // A reported failure is not a parse failure. Let it out, or the fallback
+    // below hands the CLI's error text back to the caller as their answer.
+    if (e instanceof AgentFailed) throw e
+    /* not the JSON envelope, so use it as-is */
+  }
   return { text: raw.trim(), usage: undefined }
 }
+
+/**
+ * The agent ran and reported its own failure. Distinct from a spawn error so the
+ * loop can stop rather than answer the rest of the queue with an error message.
+ */
+export class AgentFailed extends Error {}
 
 /** Run the local agent on a prompt. Resolves to { text, usage }, or throws. */
 function ask(prompt, cwd) {
@@ -269,6 +293,7 @@ async function main() {
   await telemetry({ event: 'node_start', base: BASE, cwd, pool: POOL, ownTrafficOnly: OWN_TRAFFIC_ONLY })
 
   let served = 0
+  let stopAfterThis = false
   while (served < MAX_JOBS) {
     let job
     const polledAt = now()
@@ -301,6 +326,14 @@ async function main() {
       // and no other node can pick it up.
       ok = false
       text = `The supporter node could not answer this one: ${e.message}`
+      // The agent itself reported the failure, so the next job fails the same
+      // way. Deliver this one, because taking it removed it from the queue, then
+      // stop rather than draining the queue into the same error.
+      if (e instanceof AgentFailed) {
+        log('the answering process failed:', e.message)
+        log('stopping rather than answering the rest of the queue the same way')
+        stopAfterThis = true
+      }
     }
     const answeredAt = now()
 
@@ -326,9 +359,12 @@ async function main() {
     })
     const cost = usage ? `, ${usage.input_tokens} in / ${usage.output_tokens} out, $${usage.cost_usd.toFixed(4)}` : ''
     log(`served ${job.id.slice(0, 8)} in ${((deliveredAt - gotAt) / 1000).toFixed(1)}s on this node (${text.length} chars${cost})${ok ? '' : ' [agent failed]'}`)
+    if (stopAfterThis) break
   }
   log(`done, ${served} job(s) served`)
   await telemetry({ event: 'node_stop', served })
 }
 
-main().catch((e) => { console.error('supporter node stopped:', e.message); process.exit(1) })
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((e) => { console.error('supporter node stopped:', e.message); process.exit(1) })
+}

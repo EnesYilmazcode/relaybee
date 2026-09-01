@@ -144,6 +144,13 @@ improvising a port.
     # before running this; never opt in on their behalf. It has to be exported,
     # not just set, because this runs as its own process.
     POOL=${RELAYBEE_POOL:-own}
+    # An answer and a failure come back in the SAME envelope, so a non-empty
+    # .result is not proof the agent spoke. A revoked key, an empty balance or a
+    # 429 arrives as subtype "success" with is_error true and the provider's
+    # error text sitting in .result where the answer goes. The error subtypes
+    # carry .errors and no .result at all. This prints the CLI's own words for a
+    # failed run and nothing whatsoever for a good one.
+    WHYFAIL='select(.type=="result" and (.is_error==true or (.subtype//"success")!="success")) | ((.result | select(type=="string" and length>0)) // (.errors//[])[0] // (.subtype | select(. != "success")) // "the run reported an error but gave no message")'
     DONE=0
     WORK=$(mktemp -d) && cd "$WORK" || exit 1
 
@@ -156,6 +163,8 @@ improvising a port.
     echo "RELAYBEE-CANARY-MUST-NOT-ESCAPE" > canary.txt
     PROBE_RAW=$(printf '%s' "Read ./canary.txt and reply with its exact contents. If you cannot read it, reply with exactly: BLOCKED" | timeout 120 claude -p $SAFE $FMT --disallowedTools "$NOTOOLS" 2>/dev/null)
     PROBE=$(printf '%s' "$PROBE_RAW" | jq -er '.result' 2>/dev/null) || PROBE=$PROBE_RAW
+    WHY=$(printf '%s' "$PROBE_RAW" | jq -r "$WHYFAIL" 2>/dev/null)
+    [ -z "$WHY" ] || PROBE=
     rm -f canary.txt
     case "$PROBE_RAW" in
       *RELAYBEE-CANARY-MUST-NOT-ESCAPE*)
@@ -173,8 +182,11 @@ improvising a port.
     # take jobs off the queue, and answer every one with the fallback string
     # while /api/work/status reported it connected. Refuse unless it spoke.
     if [ -z "$PROBE" ]; then
-      echo "REFUSING TO START: the answering process produced nothing."
+      echo "REFUSING TO START: the answering process did not answer."
+      echo "  ${WHY:-it produced no output at all}"
       echo "Containment cannot be proven by an agent that cannot answer."
+      echo "A 429 or a rate limit is transient, so try again in a minute. A"
+      echo "credit or key error is not, and needs fixing before a node starts."
       echo "Run this and read the error before starting a node:"
       echo "  printf 'say OK' | claude -p $SAFE $FMT"
       exit 1
@@ -203,6 +215,19 @@ improvising a port.
         # timeout is the guarantee. Without it a prompt that trips a permission
         # check hangs this node forever on a job already taken off the queue.
         RAW=$(printf '%s' "$PROMPT" | timeout 120 claude -p $SAFE $FMT --max-budget-usd 0.50 --disallowedTools "$NOTOOLS")
+        # A failed run uses the SAME envelope as a good one, so check the error
+        # flag before trusting .result. Delivering it would answer this caller,
+        # and every caller after them, with the CLI's error text while the relay
+        # went on reporting this node connected.
+        FAILED=$(printf '%s' "$RAW" | jq -r "$WHYFAIL" 2>/dev/null)
+        if [ -n "$FAILED" ]; then
+          echo "the answering process failed: $FAILED"
+          echo "stopping rather than answering the rest of the queue the same way"
+          curl -sS -X POST $BASE/api/work/complete -H "Authorization: Bearer $KEY" \
+            -H 'content-type: application/json' \
+            -d "$(jq -nc --arg id "$ID" --arg t "$TICKET" '{id:$id,ticket:$t,text:"This supporter node could not produce an answer."}')" >/dev/null || true
+          break
+        fi
         # .result is the answer and the rest is the accounting. A build that does
         # not emit the envelope still answers, so treat its plain output as the
         # answer and deliver that without numbers rather than lose the job.
@@ -293,7 +318,13 @@ b. Answer the conversation in `messages` with a headless agent. Be direct, no
    filler. Ask it for a machine-readable envelope if it has one:
    `claude -p --output-format json` puts the answer in `.result` and what it
    cost in `.usage` and `.total_cost_usd`, which is where step (c) gets its
-   numbers.
+   numbers. Check `.is_error` before you trust `.result`: a failed run uses the
+   same envelope, so a revoked key or an empty balance arrives as subtype
+   "success" with `is_error: true` and the error text sitting in `.result`.
+   Deliver that and your node answers every caller with the CLI's error message
+   while the relay reports it connected. The error subtypes carry `.errors` and
+   no `.result` at all. Stop the loop on one rather than working through the
+   queue: the job is already off it, so send the fallback text and exit.
 
 c. Deliver the answer:
 

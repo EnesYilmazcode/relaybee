@@ -851,6 +851,23 @@ t('llms.txt exists and is non-trivial', llms.length > 400, `len=${llms.length}`)
 t('llms.txt tells the agent to mint a key', /\/api\/keys\/issue/.test(llms))
 t('llms.txt describes the poll/answer/complete loop', /\/api\/work\/next/.test(llms) && /\/api\/work\/complete/.test(llms))
 t('llms.txt discloses the plaintext trust relationship', /plaintext/i.test(llms))
+
+// The startup probe and the answer path both used to trust a non-empty .result.
+// A revoked key, an empty balance or a 429 comes back in the SAME envelope as an
+// answer, so the node started, took jobs off the queue, and handed every caller
+// the CLI's error text while /api/work/status reported it connected.
+t('llms.txt defines one failure filter rather than repeating it',
+  (llms.match(/WHYFAIL=/g) ?? []).length === 1, String((llms.match(/WHYFAIL=/g) ?? []).length))
+t('and the filter reads the envelope error flag, not the length of .result',
+  llms.includes('is_error==true') && llms.includes('.subtype//"success"'))
+t('the startup probe consults it before deciding the agent spoke',
+  llms.includes('jq -r "$WHYFAIL"') && llms.includes('[ -z "$WHY" ] || PROBE='))
+t('and the refusal prints the agent own words instead of a bare message',
+  llms.includes('${WHY:-'))
+t('the answer path consults it too, and stops rather than draining the queue',
+  llms.includes('FAILED=') && llms.includes('stopping rather than answering the rest'))
+t('and the protocol section warns anyone writing their own worker',
+  llms.includes('Check `.is_error` before you trust'))
 // The script runs unattended on a volunteer's machine against their own Claude
 // subscription, so its error handling is the part that matters most. Each of
 // these guards a specific way it used to misbehave (#70).
@@ -1150,7 +1167,7 @@ t('the homepage points agents at /llms.txt', readFileSync(new URL('../public/ind
 console.log('%ssupporter script - the flags that bound spend actually parse', String.fromCharCode(10))
 {
   const { spawnSync } = await import('node:child_process')
-  const { fileURLToPath } = await import('node:url')
+  const { fileURLToPath, pathToFileURL } = await import('node:url')
   const script = fileURLToPath(new URL('../scripts/supporter.mjs', import.meta.url))
   const runSupporter = (...args: string[]) => {
     const r = spawnSync(process.execPath, [script, '--base', 'http://127.0.0.1:1', ...args], {
@@ -1162,6 +1179,34 @@ console.log('%ssupporter script - the flags that bound spend actually parse', St
   t('a valueless flag no longer swallows the flag behind it',
     contradiction.code === 1 && /contradict each other/.test(contradiction.out),
     contradiction.out.split('\n')[0] || `exit=${contradiction.code}`)
+  // parseAgent is where the same envelope carries an answer and a failure. A
+  // revoked key or an empty balance arrives as subtype "success" with is_error
+  // true and the provider's message sitting in .result, so returning .result
+  // because it is a string hands the caller the CLI's error as their answer.
+  // Run it out of process: importing the module is safe now, but spawning also
+  // proves the entrypoint guard, without which this import starts a real node.
+  const parseCase = (envelope: string) => {
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `import { parseAgent } from ${JSON.stringify(pathToFileURL(script).href)};` +
+      `try { console.log('OK:' + parseAgent(process.env.ENV_IN).text) }` +
+      `catch (e) { console.log(e.constructor.name + ':' + e.message) }`,
+    ], { encoding: 'utf8', timeout: 20_000, env: { ...process.env, ENV_IN: envelope } })
+    return ((r.stdout ?? '') + (r.stderr ?? '')).trim()
+  }
+  t('a credit failure is not delivered as the answer',
+    parseCase('{"type":"result","subtype":"success","is_error":true,"result":"Credit balance is too low"}')
+      === 'AgentFailed:Credit balance is too low')
+  t('an error subtype with no .result is caught by its .errors',
+    parseCase('{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["session crashed"]}')
+      === 'AgentFailed:session crashed')
+  t('and one with nothing to say is still refused, not answered',
+    parseCase('{"type":"result","subtype":"success","is_error":true}')
+      === 'AgentFailed:the run reported an error but gave no message')
+  t('a good envelope still answers normally',
+    parseCase('{"type":"result","subtype":"success","is_error":false,"result":"Paris."}') === 'OK:Paris.')
+  t('and plain output with no envelope is still the answer',
+    parseCase('just words') === 'OK:just words')
+
   const noCap = runSupporter('--own-traffic-only', '--max-jobs')
   t('and --max-jobs with no number stops the node instead of uncapping it',
     noCap.code === 1 && /--max-jobs is the total spend bound/.test(noCap.out),
