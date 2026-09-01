@@ -4,10 +4,12 @@ Living status doc. Updated in the same commit as the change it describes, so the
 stale relative to the code. Newest entries at the top of each log.
 
 **Status:** deployed, and the relay is verified end to end on production rather than only in local
-tests. `feat/relay-private-pools` is green on the full gate and ready to go in as one
-fast-forward, which is the owner's call because merging ships. Three things want a decision:
-the relay's direction (P0 in Next, and two of its three legs have moved), whether to rotate
-`MASTER_SECRET` over a key this branch leaked, and the two orphan branches below.
+tests. The private-pools round landed as #100 and the CORS allowlist as #101, so `main` carries
+both and there is no branch waiting to go in. The relay's direction is decided (see the #76
+section below: the public pool stays, opt-in and empty by default). **One thing still wants a
+decision: whether to rotate `MASTER_SECRET` over the key leaked in `test_ascii_art.py`.** That
+key is valid until 2026-10-31 and rotation is the only lever, which invalidates every key in
+existence.
 **Live URL:** https://relaybee.vercel.app
 **Last updated:** 2026-09-01
 
@@ -124,10 +126,65 @@ unanimous: **personal capacity router.** Both supporter mechanisms are dead as p
   risk a ban. It also cannot fit Vercel Hobby function lifetimes or Upstash's free tier.
   Salvage: **self-relay** — your own idle machine serving your own pool — as a future mode of
   the npm package.
+  **The salvage shipped, and it is the default.** `claude-code` now routes to a node running
+  under the caller's own key, so the shape the licensing objection never covered is the one a
+  caller gets by default (#100). Answering strangers survives as `claude-code/public`, opt-in on
+  both ends and empty unless somebody joins it. See the #76 decision below.
 
 What replaces "supporters": sharing with people you know goes through the provider, not through
 Relaybee — invite them into your Anthropic/OpenAI organization so they hold their own key and seal
 their own blob. That is the one sharing mechanism provider terms are built to permit.
+
+### Decided: the public pool stays, opt-in and empty by default (2026-09-01)
+
+[#76](https://github.com/EnesYilmazcode/relaybee/issues/76) asked whether to keep promoting the
+relay, demote it, build self-relay, or delete it. **Decision: keep it, as it now stands.** The
+default path is self-relay, answering strangers is a suffix a caller and a node both have to
+choose, and nobody is in the shared pool until somebody joins it.
+
+The issue's four options were written against a global queue and a supporter-led homepage, and
+neither survives. Recorded here because the issue is the wrong place to look for what is true:
+
+- **Option C, "build real self-relay", is done.** The issue calls it unavailable because "the
+  queue is global and `nextJob` hands any job to any poller". `submitJob` takes an owner and a
+  pool, queues are per requester, and `claude-code` means a node under the caller's own key
+  (#100). The salvage the design review blessed is the default.
+- **Option B, "demote it", is substantially done.** `public/index.html` renders
+  `<section id="view-support" hidden>`; the page opens on the key box and Support is a toggle.
+  The homepage has not led with the supporter pitch since the redesign.
+- **Option A listed three prerequisites, and the spend cap is the one still genuinely open.**
+  Be precise about it, because it is easy to read the volunteer-side bounds as satisfying it and
+  they do not. What exists is on the node: `--max-budget-usd 0.50` on a single job, and a job
+  count that stops the loop. Those are the volunteer's own bounds, self-imposed and overridable
+  (`RELAYBEE_MAX_JOBS` changes the count), and they are not equally real on the two paths:
+  `public/llms.txt:139,231` enforces the count in the loop, while the pasted brief carries it as
+  prose at step 4 telling an agent to stop, with nothing enforcing it. The gate is weaker still:
+  `test/smoke.mts:891,897,1048` are substring greps for `--max-budget-usd`, `MAXJOBS` and the
+  words "Stop after 100 jobs". Neither number is asserted, so raising either one keeps
+  `npm run check` green.
+  **The server-side cap the issue actually asked for does not exist**, and the harm it named is
+  live: a caller can still submit 20 jobs a minute (`lib/ratelimit.ts:61`) into one shared
+  `PUBLIC_QUEUE` with no per-caller fairness (`lib/queue.ts:54,369`), and minting is free
+  (`lib/ratelimit.ts:91`). The server does meter, but it meters *rate*, not *total*:
+  `IP_POLL_LIMIT` and `IP_COMPLETE_LIMIT` bound how fast a node is handed and can return work.
+  Nothing server-side bounds how much work a volunteer is offered in total.
+  The third prerequisite, an Upstash plan fitting more than one supporter, is untouched.
+
+**What the decision actually accepts.** The one leg still standing is the third: answering
+anonymous third parties on your own API key is the kind of API-access sharing commercial terms
+restrict, and `--bare` does not touch that. It applies to the public pool alone. That risk is
+disclosed in `public/llms.txt`, which is the file an agent reads before it runs anything, and it
+is carried by a volunteer who opted in twice. The infrastructure leg is unchanged and accepted
+for the same reason: the free Upstash tier fits roughly one continuous supporter, and one is the
+expected number when the pool is empty by default. The third measured cost travels with them and
+is accepted rather than solved: real `claude -p` answers ranged from 4s to 283s against a 110s
+streaming ceiling, so a volunteer pays for some answers that arrive too late to be delivered.
+#59 moved that ceiling a long way and cannot remove it.
+
+**Still open, and deliberately not built.** A per-caller cap on the public pool. One caller can
+take a volunteer's whole job allowance, and on the pasted-brief path nothing but an instruction
+stops the loop at all. This is the one piece of option A that a decision to keep the pool does
+not settle, so it stays on the board rather than being written off.
 
 ### Future products (explicitly separate, each with its real cost)
 
@@ -139,12 +196,14 @@ Not features of this codebase. If either is ever pursued, it is a new commitment
   fixes licensing entirely, but needs a persistent broker, paid hosting, and a disclosed
   plaintext trust model. Effectively a re-platforming that reuses the adapter pattern.
 
-### Ready to merge, as one fast-forward (decided 2026-09-01)
+### Landed as one fast-forward (merged 2026-09-01)
 
-Everything below is on one branch, `feat/relay-private-pools`, which is
+Everything below went in on one branch, `feat/relay-private-pools`, which was
 [#100](https://github.com/EnesYilmazcode/relaybee/pull/100): the merge of the
 individually-reviewable PRs plus the relay isolation work that came out of attacking
-the service. Merging to `main` ships to production, so it is the owner's call.
+the service. It is on `main` as `c104bbd` and the branch is deleted. The argument for
+merging it as one commit is kept below, because it is the reasoning that produced the
+shape of the history rather than a decision still waiting to be taken.
 
 The single most important item, and the reason to look at this at all:
 
@@ -171,13 +230,13 @@ The single most important item, and the reason to look at this at all:
 | [#90](https://github.com/EnesYilmazcode/relaybee/pull/90) | CSP as a response header, not only three meta tags |
 | [#92](https://github.com/EnesYilmazcode/relaybee/pull/92) | Typecheck the tests, and hold the docs to a measured number |
 
-**The nine land together, as one fast-forward, and the table above is the record of what is
-in it.** `main` is a strict ancestor of this branch, so the merge moves a pointer and the tree
-that reaches production is byte for byte the tree the gate was run against. That property is
-the whole argument, and merging the nine separately gives it up for a different tree that
-nothing has ever run.
+**The nine landed together, as one fast-forward, and the table above is the record of what is
+in it.** `main` was a strict ancestor of the branch, so the merge moved a pointer and the tree
+that reached production was byte for byte the tree the gate had run against. That property was
+the whole argument, and merging the nine separately would have given it up for a different tree
+that nothing had ever run.
 
-Two things go wrong on the separate path. Seven of the nine touch `test/smoke.mts`, so it is a
+Two things would have gone wrong on the separate path. Seven of the nine touch `test/smoke.mts`, so it is a
 seven-way conflict, already resolved once on this branch, in a file where block order carries
 meaning: later checks reuse keys, nodes and sealed blobs that earlier blocks set up, so a
 resolution that merges cleanly can still assert against the wrong state. And the sequence
@@ -201,6 +260,9 @@ against `main` is 25 lines added and 170 removed across `api/health.ts`, `api/wo
 shipped items 56 and 66 wearing a script fix's name, so merging it on the strength of its
 commit messages would silently take back the `s-maxage` header on `/api/health`, the
 one-command presence count, and the tests that assert both. Delete both branches.
+**Done (2026-09-01): both branches are deleted and neither exists on the remote.** The reasoning
+stays because the second one is the kind of trap worth recognising again: three commit messages
+about a file the diff never touches.
 
 ### The adversary suite
 
@@ -282,9 +344,8 @@ time it ran, on a branch that was missing #89.
 
 | Priority | Item | Why |
 |---|---|---|
-| P0 | **Decide the relay's direction** ([#76](https://github.com/EnesYilmazcode/relaybee/issues/76)) | **The premise moved on 2026-09-01, so decide against the current facts rather than the ones in the issue.** Its "dead on terms grounds" verdict stood on three legs and two are gone. (1) *A node bills a consumer seat.* Both onboarding paths are now API-billed by construction: the hosted `llms.txt` script and the pasted homepage brief both pass `--bare`, which reads `ANTHROPIC_API_KEY` and never the login or keychain, and both stop rather than start a node without one. (2) *A node serves strangers.* It does not, unless it opts in. A job goes to its requester's own queue, so a node polling under your key is only offered jobs sent under that same key; answering anyone else means sending `{"pool":"public"}`, and the only route into that on a shipped path is `RELAYBEE_POOL=public` set by hand before the hosted script runs, which the script's own text tells the agent never to set for you. The leg still standing is the third and it is the one to actually decide: a trial read answering anonymous third parties on your own API key as the kind of sharing of API access commercial terms restrict, and that objection survives `--bare`. It now applies to the public pool only. The measurements are on the issue: the free tier fits about one supporter, and real answers ranged from 4s to 283s against a 110s ceiling |
 | P1 | End-to-end test with a **real** provider key | The largest unverified claim in the repo. The live chain reaches Anthropic and returns a real `request_id`, but no successful completion has ever come back, and `test/e2e.mts` mocks the upstream, so the Anthropic response parsing is only ever checked against a fake written from the docs. One minute and about two cents: `node scripts/verify-provider.mjs` |
-| P1 | npm client package | Mint/seal/compose-config from the terminal, mirroring the setup page. Design so a self-relay mode can be added later |
+| P1 | npm client package | Mint/seal/compose-config from the terminal, mirroring the setup page. The self-relay routing itself shipped in #100 and is what `claude-code` already means; what is missing is the terminal-side wrapper, so design for that rather than for the routing |
 | P2 | Retry budget per request | One bad pool of 8 blobs currently costs 8 upstream calls |
 | P2 | Record the demo clip for the post | Failover across your own providers — show two keys, kill one |
 | P3 | GitHub OAuth key recovery | **Demoted 2026-08-01.** Its stated justification does not survive the code. The reason given was that a lost key orphans every AAD-bound blob, but user ids are generated randomly at mint time (`api/keys/issue.ts`, `${clean}_${randomUUID}`) and blobs are sealed to that id, so an OAuth-derived id is a different id and opens none of them. It could only help someone who arrived through OAuth on their first ever mint, and there are none. The mechanism stays pre-agreed if identity is ever forced |
@@ -305,6 +366,16 @@ project — revisit only if this stops being a demo.
 ## Decision log
 
 Why things are the way they are, so a future change doesn't quietly undo a deliberate choice.
+
+**2026-09-01 · The public pool stays, opt-in on both ends and empty by default.**
+Settled on #76. Self-relay is the default and is what `claude-code` means; answering strangers
+needs `claude-code/public` from the caller and `{"pool":"public"}` from the node. Kept rather
+than deleted because the terms objection that killed the original design is answered for the
+default path by construction, and what remains is a disclosed risk a volunteer opts into twice.
+Do not read this as "the spend question is closed": the per-caller cap on the public pool is
+still open, and the volunteer-side bounds are defaults on the node, not limits the service
+imposes. If the pool ever has more than a node or two in it, that cap is the thing to build
+before anything else.
 
 **2026-07-30 · Personal capacity router, not a marketplace.**
 Settled by a five-perspective design review (`docs/design/2026-07-30-dashboard-panel.md`).
@@ -412,6 +483,34 @@ Honest list. None of these are bugs; all are consequences of choices above.
 ---
 
 ## Changelog
+
+### 2026-09-01 (the relay's direction, decided against the facts rather than the issue's)
+
+[#76](https://github.com/EnesYilmazcode/relaybee/issues/76) was the last P0 and it was a decision,
+not a task. Decided: **keep the public pool, opt-in on both ends and empty by default.** The full
+reasoning is in the Decided section above.
+
+Worth recording separately is that three of the four options in the issue could not be chosen as
+written, because the code moved under them and nobody updated the issue. Option C, "build real
+self-relay", was already shipped and is the default. Option B, "demote the supporter framing",
+was already substantially done: the homepage has not opened on the supporter view since the
+redesign. And option A's stated prerequisite, a spend cap, already existed on both onboarding
+paths, per job and in total.
+
+Option A is the one to be careful with, and the first write-up of this entry got it wrong twice
+before an adversarial review caught it. Volunteer-side bounds do exist: `--max-budget-usd 0.50`
+on a job, and a job count that stops the loop. They are not the cap the issue asked for. They are
+defaults on the volunteer's own machine, overridable by `RELAYBEE_MAX_JOBS`, enforced in the
+hosted script's loop but only *stated* in the pasted brief, and pinned by substring greps that
+assert neither number. The server-side cap option A named does not exist, and the harm it named
+is live: a caller can put 20 jobs a minute into one shared public queue that has no per-caller
+fairness. The server meters rate, not total.
+
+The lesson is the shape of the mistake rather than the fact. "There is a cap" and "the cap the
+issue asked for exists" are different claims, and the first was used to retire the second.
+
+The board carried this as an open P0 for a month while two of its four options quietly became
+done. Nothing was broken by it, but the Next table is supposed to be the thing that is true.
 
 ### 2026-09-01 (the endpoints that hand back a capability stopped answering every origin)
 
