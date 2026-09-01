@@ -345,7 +345,6 @@ time it ran, on a branch that was missing #89.
 | Priority | Item | Why |
 |---|---|---|
 | P1 | End-to-end test with a **real** provider key | The largest unverified claim in the repo. The live chain reaches Anthropic and returns a real `request_id`, but no successful completion has ever come back, and `test/e2e.mts` mocks the upstream, so the Anthropic response parsing is only ever checked against a fake written from the docs. One minute and about two cents: `node scripts/verify-provider.mjs` |
-| P1 | npm client package | Mint/seal/compose-config from the terminal, mirroring the setup page. The self-relay routing itself shipped in #100 and is what `claude-code` already means; what is missing is the terminal-side wrapper, so design for that rather than for the routing |
 | P2 | Retry budget per request | One bad pool of 8 blobs currently costs 8 upstream calls |
 | P2 | Record the demo clip for the post | Failover across your own providers — show two keys, kill one |
 | P3 | GitHub OAuth key recovery | **Demoted 2026-08-01.** Its stated justification does not survive the code. The reason given was that a lost key orphans every AAD-bound blob, but user ids are generated randomly at mint time (`api/keys/issue.ts`, `${clean}_${randomUUID}`) and blobs are sealed to that id, so an OAuth-derived id is a different id and opens none of them. It could only help someone who arrived through OAuth on their first ever mint, and there are none. The mechanism stays pre-agreed if identity is ever forced |
@@ -366,6 +365,25 @@ project — revisit only if this stops being a demo.
 ## Decision log
 
 Why things are the way they are, so a future change doesn't quietly undo a deliberate choice.
+
+**2026-09-01 · The terminal client is a third script, not a package.**
+The Next table asked for an npm client that mints, seals and composes a config the way the setup
+page did. It shipped as `scripts/relaybee.mjs`, alongside `supporter.mjs` and `verify-provider.mjs`,
+rather than as a publishable package. A package directory brings a second manifest carrying the same
+name and version as the root one, a LICENSE this repo does not have, and an npm-pack line-ending
+trap on Windows that would publish a CRLF shebang and fail on every other platform, and it buys
+nothing until someone actually publishes. `scripts/` already holds two zero-dependency executable
+CLIs, so this is the shape the repo already uses. If it is ever published, that is a separate
+decision with its own costs.
+
+It talks to the deployed HTTP API rather than importing `lib/`, and that is not a shortcut: `lib/`
+is Edge-only and `MASTER_ENCRYPTION_KEY` never leaves the server, so sealing locally is not
+possible at all.
+
+The one thing worth knowing before using it is that minting twice is not refreshing a key. Every
+mint gets a fresh random user id (`api/keys/issue.ts`), and a sealed blob is bound to the id that
+sealed it, so a second mint creates a new identity and orphans every stored connection with no way
+to recover them. It refuses without `--force` and says how many would be lost.
 
 **2026-09-01 · The public pool stays, opt-in on both ends and empty by default.**
 Settled on #76. Self-relay is the default and is what `claude-code` means; answering strangers
