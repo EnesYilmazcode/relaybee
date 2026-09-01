@@ -183,7 +183,7 @@ const outage = await workNext(new Request('https://x/api/work/next', {
 t('an Upstash outage returns 503, not a bare platform error', outage.status === 503, `status=${outage.status}`)
 const outageBody = await outage.json()
 t('the outage body is a JSON error envelope', typeof outageBody?.error?.message === 'string')
-t('the outage response still carries CORS', outage.headers.get('access-control-allow-origin') === '*')
+t('the outage response still carries the CORS envelope', (outage.headers.get('vary') ?? '').includes('origin'))
 
 console.log('\nupstash — /api/health does not hand out free queue reads')
 const health = (await import('../api/health.ts')).default

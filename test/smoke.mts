@@ -597,7 +597,8 @@ const boom = () => new Proxy({}, { get() { throw new Error('forced') } }) as unk
 const issueErr = await issueHandler(boom())
 const issueErrJson = await issueErr.json()
 t('issue: a forced error returns a clean 500', issueErr.status === 500)
-t('issue: the error path keeps CORS', issueErr.headers.get('access-control-allow-origin') === '*')
+t('issue: the error path keeps the CORS envelope', (issueErr.headers.get('vary') ?? '').includes('origin') && (issueErr.headers.get('access-control-allow-methods') ?? '').includes('POST'))
+t('issue: and a request whose headers throw does not become a wildcard', issueErr.headers.get('access-control-allow-origin') === null)
 t('issue: the error path carries a {message,type} envelope', typeof issueErrJson.error?.message === 'string' && typeof issueErrJson.error?.type === 'string')
 
 const connectErr = await connectHandler(boom())
@@ -605,6 +606,44 @@ const connectErrJson = await connectErr.json()
 t('connect: a forced error returns a clean 500', connectErr.status === 500)
 t('connect: the error path keeps CORS', connectErr.headers.get('access-control-allow-origin') === '*')
 t('connect: the error path carries a {message,type} envelope', typeof connectErrJson.error?.message === 'string' && typeof connectErrJson.error?.type === 'string')
+
+console.log('\nCORS — the capability endpoints answer named origins, not everyone')
+// /api/keys/issue is an unauthenticated simple POST, so a wildcard let any page
+// a visitor loaded mint a key in their browser and poll the relay from their IP,
+// with no preflight to refuse. Preflight returns before the meter, so probing it
+// costs no quota.
+const pre = (h: (r: Request) => Promise<Response>, url: string, origin?: string) =>
+  h(new Request(url, { method: 'OPTIONS', headers: origin ? { origin } : {} }))
+
+delete process.env.RELAYBEE_ALLOWED_ORIGINS
+const sameOrigin = await pre(issueHandler, 'https://x/api/keys/issue')
+t('issue: a same-origin caller needs no allow-origin header at all',
+  sameOrigin.headers.get('access-control-allow-origin') === null)
+t('issue: and the answer varies on origin, so no cache can cross-serve it',
+  (sameOrigin.headers.get('vary') ?? '').includes('origin'))
+const stranger = await pre(issueHandler, 'https://x/api/keys/issue', 'https://evil.example')
+t('issue: an unknown origin is not reflected',
+  stranger.headers.get('access-control-allow-origin') === null)
+
+process.env.RELAYBEE_ALLOWED_ORIGINS = 'https://friend.example, https://other.example'
+const friend = await pre(issueHandler, 'https://x/api/keys/issue', 'https://friend.example')
+t('issue: an allow-listed origin is reflected back',
+  friend.headers.get('access-control-allow-origin') === 'https://friend.example', friend.headers.get('access-control-allow-origin') ?? 'none')
+t('issue: the list is read per call, so a warm instance picks up a change',
+  (await pre(issueHandler, 'https://x/api/keys/issue', 'https://other.example')).headers.get('access-control-allow-origin') === 'https://other.example')
+t('issue: and allow-listing one origin does not open it to another',
+  (await pre(issueHandler, 'https://x/api/keys/issue', 'https://evil.example')).headers.get('access-control-allow-origin') === null)
+delete process.env.RELAYBEE_ALLOWED_ORIGINS
+
+t('work/next: the relay poll is not open to arbitrary pages either',
+  (await pre(workNext, 'https://x/api/work/next', 'https://evil.example')).headers.get('access-control-allow-origin') === null)
+t('work/status: nor is the presence read',
+  (await pre(workStatus, 'https://x/api/work/status', 'https://evil.example')).headers.get('access-control-allow-origin') === null)
+
+// The proxy keeps its wildcard on purpose: it is the public API surface, callers
+// are expected to be arbitrary origins, and it hands back no credential.
+t('the proxy path is still open to any origin, which is the deliberate half',
+  (await chatCompletions(new Request('https://x/api/v1/chat/completions', { method: 'OPTIONS', headers: { origin: 'https://evil.example' } }))).headers.get('access-control-allow-origin') === '*')
 
 const { readFileSync, existsSync } = await import('node:fs')
 

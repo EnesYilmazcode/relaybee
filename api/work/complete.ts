@@ -14,11 +14,13 @@
 import { verifyKey, bearer } from '../../lib/auth'
 import { completeJob, checkTicket, type Usage } from '../../lib/queue'
 import { check, clientIp, rlHeaders } from '../../lib/ratelimit'
+import { corsFor } from '../../lib/cors'
 
 export const config = { runtime: 'edge' }
 
-const CORS = {
-  'access-control-allow-origin': '*',
+const cors = (req: Request) => corsFor(req, CORS_BASE)
+
+const CORS_BASE = {
   'access-control-allow-headers': 'authorization, content-type',
   'access-control-allow-methods': 'POST, OPTIONS',
   'access-control-expose-headers': 'x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-reset',
@@ -27,11 +29,10 @@ const CORS = {
 const MAX_ANSWER_BYTES = 64 * 1024
 const IP_COMPLETE_LIMIT = 30
 
-function json(status: number, obj: unknown, extra: Record<string, string> = {}) {
-  return new Response(JSON.stringify(obj), {
-    status, headers: { 'content-type': 'application/json', ...CORS, ...extra },
+const jsonFor = (req: Request) => (status: number, obj: unknown, extra: Record<string, string> = {}) =>
+  new Response(JSON.stringify(obj), {
+    status, headers: { 'content-type': 'application/json', ...cors(req), ...extra },
   })
-}
 
 /**
  * A node's self-reported cost for the job it just answered.
@@ -59,7 +60,8 @@ function readUsage(raw: unknown): Usage | undefined {
 }
 
 export default async function handler(req: Request): Promise<Response> {
-  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS })
+  const json = jsonFor(req)
+  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors(req) })
   if (req.method !== 'POST') return json(405, { error: { message: 'Use POST.' } })
 
   const auth = await verifyKey(bearer(req))
