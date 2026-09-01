@@ -615,6 +615,7 @@ console.log('\nCORS — the capability endpoints answer named origins, not every
 const pre = (h: (r: Request) => Promise<Response>, url: string, origin?: string) =>
   h(new Request(url, { method: 'OPTIONS', headers: origin ? { origin } : {} }))
 
+const priorAllowed = process.env.RELAYBEE_ALLOWED_ORIGINS
 delete process.env.RELAYBEE_ALLOWED_ORIGINS
 const sameOrigin = await pre(issueHandler, 'https://x/api/keys/issue')
 t('issue: a same-origin caller needs no allow-origin header at all',
@@ -629,16 +630,45 @@ process.env.RELAYBEE_ALLOWED_ORIGINS = 'https://friend.example, https://other.ex
 const friend = await pre(issueHandler, 'https://x/api/keys/issue', 'https://friend.example')
 t('issue: an allow-listed origin is reflected back',
   friend.headers.get('access-control-allow-origin') === 'https://friend.example', friend.headers.get('access-control-allow-origin') ?? 'none')
-t('issue: the list is read per call, so a warm instance picks up a change',
+t('issue: every entry on the list is honoured, not only the first',
   (await pre(issueHandler, 'https://x/api/keys/issue', 'https://other.example')).headers.get('access-control-allow-origin') === 'https://other.example')
 t('issue: and allow-listing one origin does not open it to another',
   (await pre(issueHandler, 'https://x/api/keys/issue', 'https://evil.example')).headers.get('access-control-allow-origin') === null)
+
+// includes() on the array is exact string equality, and the difference is
+// load-bearing: under a prefix or suffix match an attacker registers a domain
+// built out of an allow-listed one and gets reflected. Nothing else pins that.
+t('issue: an origin that merely starts with an allow-listed one is refused',
+  (await pre(issueHandler, 'https://x/api/keys/issue', 'https://friend.example.evil.example')).headers.get('access-control-allow-origin') === null)
+t('issue: and one that merely ends with an allow-listed name is refused too',
+  (await pre(issueHandler, 'https://x/api/keys/issue', 'https://evilfriend.example')).headers.get('access-control-allow-origin') === null)
 delete process.env.RELAYBEE_ALLOWED_ORIGINS
 
-t('work/next: the relay poll is not open to arbitrary pages either',
-  (await pre(workNext, 'https://x/api/work/next', 'https://evil.example')).headers.get('access-control-allow-origin') === null)
-t('work/status: nor is the presence read',
-  (await pre(workStatus, 'https://x/api/work/status', 'https://evil.example')).headers.get('access-control-allow-origin') === null)
+// Both directions on every relay endpoint. Refusing a stranger is not on its own
+// evidence of a working allowlist: an endpoint that never received the request,
+// or that answers a bare 204 with no CORS at all, returns the same null. Each of
+// those was a live mutation that the one-directional checks passed straight over,
+// so the reflection is pinned here too.
+const relayEndpoints: [string, (r: Request) => Promise<Response>, string][] = [
+  ['work/next', workNext, 'https://x/api/work/next'],
+  ['work/status', workStatus, 'https://x/api/work/status'],
+  ['work/complete', workComplete, 'https://x/api/work/complete'],
+]
+for (const [name, relayHandler, relayUrl] of relayEndpoints) {
+  const hostile = await pre(relayHandler, relayUrl, 'https://evil.example')
+  t(`${name}: an arbitrary page is not reflected`,
+    hostile.headers.get('access-control-allow-origin') === null)
+  t(`${name}: and the refusal is still a CORS envelope, not a bare 204`,
+    (hostile.headers.get('vary') ?? '').includes('origin')
+      && (hostile.headers.get('access-control-allow-methods') ?? '') !== '')
+  process.env.RELAYBEE_ALLOWED_ORIGINS = 'https://friend.example'
+  const welcomed = await pre(relayHandler, relayUrl, 'https://friend.example')
+  t(`${name}: an allow-listed origin is reflected, so the list is wired here at all`,
+    welcomed.headers.get('access-control-allow-origin') === 'https://friend.example',
+    welcomed.headers.get('access-control-allow-origin') ?? 'none')
+  delete process.env.RELAYBEE_ALLOWED_ORIGINS
+}
+if (priorAllowed !== undefined) process.env.RELAYBEE_ALLOWED_ORIGINS = priorAllowed
 
 // The proxy keeps its wildcard on purpose: it is the public API surface, callers
 // are expected to be arbitrary origins, and it hands back no credential.

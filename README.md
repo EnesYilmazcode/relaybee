@@ -218,6 +218,10 @@ For a fuller tour of the design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md
 - The relay uses an in-memory queue unless Upstash is set, so on the free tier a caller and a
   supporter only meet if they land on the same server. Set `UPSTASH_REDIS_REST_URL` and
   `UPSTASH_REDIS_REST_TOKEN` to make it work everywhere.
+- `/api/keys/issue` and `/api/work/*` answer same-origin callers only. They hand back a bearer
+  key or a queued job, so they no longer reply to every origin with `*`. A front end on another
+  domain needs its origin named in `RELAYBEE_ALLOWED_ORIGINS`, comma separated and matched
+  exactly. Empty by default. The proxy path and `/api/health` stay open to any origin on purpose.
 - A lost key cannot be shown again, and nothing on the server can look it up. Copy it when you mint
   it. The browser remembers it, so a cleared site storage is a lost key.
 - This is a demo. The free hosting tier is not for commercial use.
