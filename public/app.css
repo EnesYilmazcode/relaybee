@@ -37,6 +37,14 @@ h1 { font-size: 30px; font-weight: 700; letter-spacing: -0.03em; margin: 0 0 28p
   padding: 12px 16px; font-family: var(--mono); font-size: 13.5px;
   overflow-x: auto; white-space: nowrap;
 }
+/* The key shares .keyrow but is a single unbreakable token, so it scrolls
+   sideways. The connect line is a sentence: nowrap hid all but the first few
+   words of it, and the words are the instruction. Let this one wrap. */
+#connect-line {
+  display: block; white-space: normal; overflow-x: visible;
+  text-align: left; line-height: 1.6; word-break: break-word;
+}
+
 button.icon {
   flex: 0 0 auto; width: 44px; cursor: pointer; border-radius: 9px;
   background: transparent; color: var(--dim); border: 1px solid var(--line);

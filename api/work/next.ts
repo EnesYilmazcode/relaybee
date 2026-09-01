@@ -1,12 +1,20 @@
 // Supporter side of the relay: long-poll for the next queued chat job.
 //
-// Auth is an ordinary Relaybee key — a supporter is just a user who polls. The
-// response is the raw job (id, model, messages); 204 means nothing came in
-// during the poll window, poll again. Supporters see prompts in plaintext:
-// that is inherent to the relay and is disclosed where the worker is set up.
+// Auth is an ordinary Relaybee key — a supporter is just a user who polls — and
+// what that key gets you is YOUR OWN queue: jobs submitted under the same key.
+// That is the whole access control, and it is why minting a free key no longer
+// shows you anyone else's prompts.
+//
+// Send {"pool":"public"} to also watch the shared pool, where callers who sent
+// "claude-code/public" have offered their jobs to anyone. That is opt-in on
+// purpose: taking a stranger's job means reading a stranger's prompt in
+// plaintext and having them read whatever you send back.
+//
+// The response is the job plus a `ticket`, which is what /api/work/complete
+// requires as proof you were the node that took it.
 
 import { verifyKey, bearer } from '../../lib/auth'
-import { nextJob, markLive } from '../../lib/queue'
+import { nextJob, markLive, issueTicket } from '../../lib/queue'
 import { check, clientIp, rlHeaders } from '../../lib/ratelimit'
 
 export const config = { runtime: 'edge' }
@@ -63,21 +71,32 @@ export default async function handler(req: Request): Promise<Response> {
   const rl = check(`poll:${clientIp(req)}`, IP_POLL_LIMIT)
   const rlh = rlHeaders(rl)
   if (!rl.ok) {
-    return new Response(JSON.stringify({ error: { message: 'Polling too fast. One request at a time is enough — each holds for 20s.', type: 'rate_limit_error' } }), {
+    return new Response(JSON.stringify({ error: { message: 'Polling too fast. One request at a time is enough — each holds for 15s.', type: 'rate_limit_error' } }), {
       status: 429, headers: { 'content-type': 'application/json', ...CORS, ...rlh },
     })
   }
+
+  // A body is optional, and an unreadable one is not worth failing a poll over:
+  // the safe reading of "I could not tell what you asked for" is your own queue.
+  let wantsPublic = false
+  try {
+    const body = (await req.json()) as { pool?: unknown } | null
+    wantsPublic = body?.pool === 'public'
+  } catch { /* no body, or not JSON: own queue only */ }
 
   // Mark presence up front — a node polling for work is a live node whether or
   // not this particular poll returns a job. This is what /api/work/status reads
   // so the site can light up "connected" the moment the worker loop starts.
   try {
-    if (shouldBeat(auth.u)) await markLive(auth.u)
+    if (shouldBeat(auth.u)) await markLive(auth.u, wantsPublic)
 
-    const job = await nextJob(POLL_WINDOW_MS)
+    const job = await nextJob(POLL_WINDOW_MS, auth.u, wantsPublic)
     if (!job) return new Response(null, { status: 204, headers: { ...CORS, ...rlh } })
 
-    return new Response(JSON.stringify(job), {
+    // Issued here, to this key, for this job. Recomputed on delivery, so no
+    // storage and no extra queue command.
+    const ticket = await issueTicket(job.id, auth.u)
+    return new Response(JSON.stringify({ ...job, ticket }), {
       headers: { 'content-type': 'application/json', ...CORS, ...rlh },
     })
   } catch {

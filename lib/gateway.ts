@@ -9,7 +9,7 @@ import { verifyKey, bearer } from './auth'
 import { open, type Connection } from './seal'
 import { route, ADAPTERS, type ChatRequest } from './providers'
 import { check, LIMITS, clientIp, IP_PROXY_LIMIT, rlHeaders } from './ratelimit'
-import { submitJob, awaitResult, cancelJob, countLive, type Job } from './queue'
+import { submitJob, awaitResult, cancelJob, countLivePublic, isLive, type Job, type Usage, type Pool } from './queue'
 import { hasSecrets, NOT_CONFIGURED } from './config'
 
 const CORS = {
@@ -65,6 +65,25 @@ function shouldFailover(status: number) {
 // Eight is well past any legitimate pool and bounds the blast radius.
 export const MAX_POOL = 8
 
+/**
+ * The OpenAI models list.
+ *
+ * Every id in `data` has to be something a caller can put in `model` and have
+ * work, because that is the entire contract of this endpoint and clients build
+ * model pickers straight out of it. This used to return the provider names with
+ * `object: "provider"`, which meant a picker offered "anthropic" and every pick
+ * came back 400: routing wants "<provider>/<model>", not a bare provider.
+ *
+ * `data` is the relay ids, built from the constants the router dispatches on so
+ * the list cannot drift from what routes. Both of them belong on it because they
+ * are different capacity: the bare id reaches only nodes running under the
+ * caller's own key, so advertising it alone hands every caller without a node of
+ * their own the one id that is guaranteed to time out for them, and hides the
+ * only id that reaches anybody else's machine.
+ *
+ * The providers are still worth reporting, they are just not models, so they
+ * moved to their own field with the shape a caller has to build.
+ */
 export async function listModels(req: Request): Promise<Response> {
   if (req.method === 'OPTIONS') return preflight()
   const g = await gate(req)
@@ -72,7 +91,8 @@ export async function listModels(req: Request): Promise<Response> {
   return new Response(
     JSON.stringify({
       object: 'list',
-      data: [...Object.keys(ADAPTERS), RELAY_PROVIDER].map((id) => ({ id, object: 'provider' })),
+      data: RELAY_MODELS.map((id) => ({ id, object: 'model', owned_by: 'relaybee' })),
+      providers: Object.keys(ADAPTERS).map((id) => ({ id, model_format: `${id}/<model>` })),
     }),
     { headers: { 'content-type': 'application/json', ...CORS, ...g.headers } },
   )
@@ -85,6 +105,20 @@ export async function listModels(req: Request): Promise<Response> {
 // capacity. Non-streaming in substance; stream:true gets the finished answer as
 // a single SSE chunk so OpenAI clients that always stream still work.
 const RELAY_PROVIDER = 'claude-code'
+// "claude-code" goes to the caller's own nodes. "claude-code/public" offers the
+// job to anyone running a node that has opted into the shared pool.
+//
+// The default used to be the second one, without anyone choosing it: every job
+// went to one global list that any free key could drain. Reading a stranger's
+// prompt and writing a stranger's answer are both things to agree to, so they
+// are now named on both sides.
+const PUBLIC_SUFFIX = 'public'
+const poolFor = (model: string): Pool =>
+  model.slice(RELAY_PROVIDER.length + 1) === PUBLIC_SUFFIX ? 'public' : 'own'
+// Spelled from the same two constants poolFor reads, so a change to either one
+// moves the router and the models list together instead of leaving the list to
+// advertise a spelling that stopped routing.
+const RELAY_MODELS = [RELAY_PROVIDER, `${RELAY_PROVIDER}/${PUBLIC_SUFFIX}`]
 // The buffered path emits nothing until the answer is complete, so it is bounded
 // by Vercel Edge's ~25s initial-response deadline. Exceed that and a timeout
 // surfaces as platform 504 HTML instead of our clean JSON, so we give up first.
@@ -105,7 +139,34 @@ const MAX_JOB_BYTES = 32 * 1024
 // oversized payload is both an amplification vector and a way to burn function
 // time on JSON.parse. 256KB is far past any legitimate chat request (the relay
 // caps its own message payload at 32KB) and rejects the rest cleanly.
+//
+// Counted in bytes, which is what the name says and what the cost is. This was
+// measured on a JS string's .length, and that counts UTF-16 code units: every
+// CJK character is one unit and three bytes, so the real ceiling was 768KB, and
+// past the pool walk that is eight outbound copies of it. api/work/complete.ts
+// already did this correctly with a TextEncoder; these two did not.
 export const MAX_BODY_BYTES = 256 * 1024
+
+/**
+ * A supporter's reported cost, in the shape OpenAI clients read.
+ *
+ * Zeros when a node reported nothing. That is the honest answer rather than a
+ * guess: the relay never sees the model call, so there is nothing here to
+ * estimate from, and a character-count approximation dressed as a token count
+ * is worse than a zero in a product whose whole point is cost.
+ *
+ * cost_usd is Relaybee's own field, because OpenAI has no place for a number
+ * the upstream actually knows. A client that ignores it loses nothing.
+ */
+function openaiUsage(u: Usage | undefined) {
+  if (!u) return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+  return {
+    prompt_tokens: u.inputTokens,
+    completion_tokens: u.outputTokens,
+    total_tokens: u.inputTokens + u.outputTokens,
+    cost_usd: u.costUsd,
+  }
+}
 
 /** OpenAI content can be a string or an array of typed parts; jobs carry plain text. */
 function flatten(content: unknown): string {
@@ -116,7 +177,8 @@ function flatten(content: unknown): string {
   return ''
 }
 
-async function relayCompletion(body: ChatRequest, headers: Record<string, string>): Promise<Response> {
+async function relayCompletion(body: ChatRequest, owner: string, headers: Record<string, string>): Promise<Response> {
+  const pool = poolFor(body.model)
   // Message elements are unknown-typed from the wire; a null or non-object entry
   // would throw on property access, so coerce defensively rather than trust them.
   const messages: Job['messages'] = body.messages.map((m) => ({
@@ -127,13 +189,13 @@ async function relayCompletion(body: ChatRequest, headers: Record<string, string
     return err(400, 'No text content to relay. The claude-code model needs at least one message with text.', 'invalid_request_error', headers)
   }
   const payload = JSON.stringify(messages)
-  if (payload.length > MAX_JOB_BYTES) {
+  if (new TextEncoder().encode(payload).length > MAX_JOB_BYTES) {
     return err(400, `Request too large for the relay: cap is ${MAX_JOB_BYTES / 1024}KB of messages.`, 'invalid_request_error', headers)
   }
 
   let job: Job
   try {
-    job = await submitJob(body.model, messages)
+    job = await submitJob(body.model, messages, owner, pool)
   } catch {
     // A queue-backend hiccup (e.g. transient Upstash 5xx) must not escape as a
     // bare platform 500 with no CORS or error envelope.
@@ -143,26 +205,26 @@ async function relayCompletion(body: ChatRequest, headers: Record<string, string
   const created = Math.floor(Date.now() / 1000)
   const relayHeaders = { ...headers, 'x-relaybee-provider': RELAY_PROVIDER }
 
-  if (body.stream) return relayStream(job, body, created, relayHeaders)
+  if (body.stream) return relayStream(job, body, owner, pool, created, relayHeaders)
 
-  let text: string | null
+  let result: Awaited<ReturnType<typeof awaitResult>>
   try {
-    text = await awaitResult(job.id, RELAY_WAIT_MS)
+    result = await awaitResult(job.id, RELAY_WAIT_MS)
   } catch {
     return err(502, 'The relay queue is temporarily unavailable. Try again shortly.', 'api_error', headers)
   }
-  if (text === null) {
+  if (result === null) {
     // Nobody is waiting for this any more. Leaving it queued means the next
     // supporter to connect spends real model time on an answer no one reads.
-    await cancelJob(job).catch(() => {})
-    return err(504, await timedOutMessage(), 'api_error', headers)
+    await cancelJob(job, owner, pool).catch(() => {})
+    return err(504, await timedOutMessage(owner, pool), 'api_error', headers)
   }
 
   return new Response(
     JSON.stringify({
       id: `chatcmpl-${job.id}`, object: 'chat.completion', created, model: body.model,
-      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      choices: [{ index: 0, message: { role: 'assistant', content: result.text }, finish_reason: 'stop' }],
+      usage: openaiUsage(result.usage),
     }),
     { headers: { 'content-type': 'application/json', ...CORS, ...relayHeaders } },
   )
@@ -174,14 +236,36 @@ async function relayCompletion(body: ChatRequest, headers: Record<string, string
  * caller to retry while a supporter is mid answer just queues the same prompt
  * twice and spends their tokens twice.
  */
-async function timedOutMessage(known?: boolean): Promise<string> {
-  let online = known
-  if (online === undefined) {
-    try { online = (await countLive()) > 0 } catch { online = false }
+async function timedOutMessage(owner: string, pool: Pool, known?: Serving): Promise<string> {
+  const serving = known ?? (await anyoneCanServe(owner, pool))
+  if (serving === 'yes') {
+    return `A supporter took this and did not finish inside ${RELAY_WAIT_MS / 1000}s. Send "stream": true and Relaybee holds the connection open while they work, which is what long answers need.`
   }
-  return online
-    ? `A supporter took this and did not finish inside ${RELAY_WAIT_MS / 1000}s. Send "stream": true and Relaybee holds the connection open while they work, which is what long answers need.`
-    : 'No supporter is online right now. The relay only answers while someone is running a supporter node, so try again later, or run one yourself.'
+  return pool === 'public'
+    ? 'No node is watching the public pool right now. Run one yourself, or drop the "/public" suffix to use your own.'
+    : `No node of your own is online. "${RELAY_PROVIDER}" is served by machines running a supporter node under this same API key, so start one, or send "${RELAY_PROVIDER}/${PUBLIC_SUFFIX}" to offer the job to anyone who has opted into the shared pool.`
+}
+
+/**
+ * Whether any node could take this particular job.
+ *
+ * A job goes to exactly one queue, so the presence that decides its fate is
+ * per-pool. The global count cannot answer for "/public": every node marks
+ * itself live whether or not it opted in, so a count above zero would report
+ * one own-only node anywhere in the world as capacity for a public caller and
+ * hold them for the whole streaming window on the strength of it. The opt-in is
+ * recorded where a node opts in, in api/work/next.ts, and read back here.
+ * Either way this is one presence command.
+ */
+type Serving = 'yes' | 'no'
+
+async function anyoneCanServe(owner: string, pool: Pool): Promise<Serving> {
+  try {
+    if (pool !== 'public') return (await isLive(owner)) ? 'yes' : 'no'
+    return (await countLivePublic()) > 0 ? 'yes' : 'no'
+  } catch {
+    return 'no'
+  }
 }
 
 /**
@@ -190,7 +274,8 @@ async function timedOutMessage(known?: boolean): Promise<string> {
  * wait in slices, sending an SSE comment between them so nothing along the path
  * decides the connection is idle.
  */
-function relayStream(job: Job, body: ChatRequest, created: number, relayHeaders: Record<string, string>): Response {
+function relayStream(job: Job, body: ChatRequest, owner: string, pool: Pool, created: number, relayHeaders: Record<string, string>): Response {
+  const includeUsage = (body.stream_options as { include_usage?: unknown } | undefined)?.include_usage === true
   const encoder = new TextEncoder()
   const frame = (o: unknown) => `data: ${JSON.stringify(o)}\n\n`
   const chunk = (delta: unknown, finish: string | null) => ({
@@ -204,35 +289,47 @@ function relayStream(job: Job, body: ChatRequest, created: number, relayHeaders:
       send(frame(chunk({ role: 'assistant' }, null)))
 
       const deadline = Date.now() + RELAY_STREAM_WAIT_MS
-      let text: string | null = null
-      let online: boolean | undefined
+      let result: Awaited<ReturnType<typeof awaitResult>> = null
+      let online: Serving | undefined
       let checked = false
 
       while (Date.now() < deadline) {
         const slice = Math.min(RELAY_SLICE_MS, deadline - Date.now())
         try {
-          text = await awaitResult(job.id, slice)
+          result = await awaitResult(job.id, slice)
         } catch {
           break
         }
-        if (text !== null) break
+        if (result !== null) break
         // One presence check, after the first empty slice. If nothing is polling
         // the queue then no answer is coming, and holding the caller for the
-        // full window would be a worse experience than the old 20s cap.
+        // full window would be a worse experience than the old 20s cap. Only a
+        // definite "no" ends the wait: an unresolved public pool still has a
+        // node that may be mid answer, and cutting that caller off at 15s is the
+        // exact failure the 110s window exists to prevent.
         if (!checked) {
           checked = true
-          try { online = (await countLive()) > 0 } catch { online = false }
-          if (!online) break
+          online = await anyoneCanServe(owner, pool)
+          if (online === 'no') break
         }
         send(': waiting for a supporter\n\n')
       }
 
-      if (text === null) {
-        await cancelJob(job).catch(() => {})
-        send(frame({ error: { message: await timedOutMessage(online), type: 'api_error' } }))
+      if (result === null) {
+        await cancelJob(job, owner, pool).catch(() => {})
+        send(frame({ error: { message: await timedOutMessage(owner, pool, online), type: 'api_error' } }))
       } else {
-        send(frame(chunk({ content: text }, null)))
+        send(frame(chunk({ content: result.text }, null)))
         send(frame(chunk({}, 'stop')))
+        // OpenAI convention, and the same one the provider path already follows:
+        // a trailing usage chunk only when the caller opted in. Its choices array
+        // is empty, which is what tells a client the chunk is accounting.
+        if (includeUsage) {
+          send(frame({
+            id: `chatcmpl-${job.id}`, object: 'chat.completion.chunk', created, model: body.model,
+            choices: [], usage: openaiUsage(result.usage),
+          }))
+        }
       }
       send('data: [DONE]\n\n')
       controller.close()
@@ -265,15 +362,18 @@ async function chatCompletionsInner(req: Request): Promise<Response> {
   // Read the body once as text so we can bound its size before parsing or
   // touching any upstream. An oversized payload is rejected here — before the
   // relay submit or any provider fetch — so it can never be amplified outward.
-  let rawBody: string
+  // arrayBuffer, not text: byteLength is the real size, and measuring it before
+  // decoding also avoids materialising the string for a body we are rejecting.
+  let rawBytes: ArrayBuffer
   try {
-    rawBody = await req.text()
+    rawBytes = await req.arrayBuffer()
   } catch {
     return err(400, 'Could not read the request body.', 'invalid_request_error', headers)
   }
-  if (rawBody.length > MAX_BODY_BYTES) {
+  if (rawBytes.byteLength > MAX_BODY_BYTES) {
     return err(400, `Request body too large: cap is ${MAX_BODY_BYTES / 1024}KB.`, 'invalid_request_error', headers)
   }
+  const rawBody = new TextDecoder().decode(rawBytes)
 
   let body: ChatRequest
   try {
@@ -289,7 +389,7 @@ async function chatCompletionsInner(req: Request): Promise<Response> {
   }
 
   if (body.model === RELAY_PROVIDER || body.model.startsWith(`${RELAY_PROVIDER}/`)) {
-    return relayCompletion(body, headers)
+    return relayCompletion(body, auth.u, headers)
   }
 
   const routed = route(body.model)
@@ -323,6 +423,19 @@ async function chatCompletionsInner(req: Request): Promise<Response> {
   }
   if (conns.length === 0) {
     return err(403, `No valid ${adapter.id} connection for this key. Blobs are bound to the user who created them.`, 'permission_error', headers)
+  }
+
+  // A pooled request is metered for what it is about to do, not for being one
+  // request. Walking N connections means up to N upstream calls, and pricing
+  // that at 1 turned /api/connect plus the pool walk into a cheap batch oracle
+  // for provider keys: seal 8 candidates, send one request, read each one's real
+  // upstream status out of x-relaybee-pool-health. Failover is untouched for
+  // anyone using it honestly; it just costs what it costs.
+  if (conns.length > 1) {
+    const extra = check(`ip:${clientIp(req)}`, IP_PROXY_LIMIT, conns.length - 1)
+    if (!extra.ok) {
+      return err(429, `Rate limit exceeded for this source. A pooled request is metered per connection, and this one asked for ${conns.length}.`, 'rate_limit_error', headers)
+    }
   }
 
   // Start at a random offset so load spreads across the pool instead of always

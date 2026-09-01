@@ -15,12 +15,12 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      # Typecheck plus the smoke suite (auth, sealing, routing, streaming,
-      # abuse limits, and the full supporter-relay round-trip). Gates every
+      # `check` is typecheck, the smoke suite, the Upstash path, the HTTP e2e
+      # run, and the adversary suite. All four boot the real handlers locally,
+      # need no credentials and make no model calls, so all four can gate every
       # push to main, which is what Vercel deploys to production.
       - run: npm run check
-      # End-to-end test: boots the real edge handlers on a local Node server and
-      # drives them over HTTP (mint key, supporter worker loop, relay round-trip,
-      # and the bring-your-own-keys path against a fake provider). Self-contained
-      # and deterministic — no network, no real providers — so it is CI-safe.
-      - run: npm run test:e2e
+      # Called out separately because of what it is rather than what it costs:
+      # it mints its own keys and attacks the service as a stranger. Every check
+      # in it passes only when an attack FAILS. See test/adversary.mts.
+      - run: npm run test:adversary

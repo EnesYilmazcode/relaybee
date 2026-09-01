@@ -10,8 +10,6 @@
 //
 // Uses throwaway secrets and never touches a real provider.
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { AddressInfo } from 'node:net'
 
 process.env.MASTER_SECRET = 'e2e-secret-not-real'
 process.env.MASTER_ENCRYPTION_KEY = Buffer.from(new Uint8Array(32).fill(9)).toString('base64url')
@@ -23,9 +21,10 @@ const workNext = (await import('../api/work/next.ts')).default
 const workComplete = (await import('../api/work/complete.ts')).default
 const workStatus = (await import('../api/work/status.ts')).default
 const health = (await import('../api/health.ts')).default
+const { serveRoutes } = await import('./local-server.mts')
+import type { Routes } from './local-server.mts'
 
-type Handler = (req: Request) => Promise<Response> | Response
-const routes: Record<string, Handler> = {
+const routes: Routes = {
   'POST /api/keys/issue': issue,
   'POST /api/connect': connect,
   'POST /api/v1/chat/completions': chat,
@@ -35,46 +34,10 @@ const routes: Record<string, Handler> = {
   'GET /api/health': health,
 }
 
-// Adapt Node's req/res to the Web Request/Response the handlers speak.
-async function toRequest(req: IncomingMessage, base: string): Promise<Request> {
-  const chunks: Buffer[] = []
-  for await (const c of req) chunks.push(c as Buffer)
-  const body = chunks.length ? Buffer.concat(chunks) : undefined
-  const headers = new Headers()
-  for (const [k, v] of Object.entries(req.headers)) if (typeof v === 'string') headers.set(k, v)
-  return new Request(base + req.url, { method: req.method, headers, body: body as any })
-}
-
-async function writeResponse(res: Response, out: ServerResponse) {
-  out.statusCode = res.status
-  res.headers.forEach((v, k) => out.setHeader(k, v))
-  if (res.body) {
-    const reader = res.body.getReader()
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      out.write(Buffer.from(value))
-    }
-  }
-  out.end()
-}
-
-const server = createServer(async (req, res) => {
-  const base = `http://127.0.0.1:${port}`
-  const url = new URL(base + req.url)
-  const handler = routes[`${req.method} ${url.pathname}`]
-  if (!handler) { res.statusCode = 404; res.end('no route'); return }
-  try {
-    const request = await toRequest(req, base)
-    await writeResponse(await handler(request), res)
-  } catch (e) {
-    res.statusCode = 500
-    res.end(String(e))
-  }
-})
-await new Promise<void>((r) => server.listen(0, r))
-const port = (server.address() as AddressInfo).port
-const BASE = `http://127.0.0.1:${port}`
+// The route table above, served on an ephemeral port. The twenty lines that
+// adapted Node's req/res to a Web Request used to live here, in this file and
+// two others; they live in test/local-server.mts now.
+const { base: BASE, close: closeServer } = await serveRoutes(routes)
 
 let failed = 0
 const t = (name: string, cond: boolean, extra = '') => {
@@ -96,6 +59,9 @@ async function supporter(key: string) {
   while (workerOn) {
     let res: Response
     try {
+      // No body means the node's own queue, which is where a job submitted
+      // under this same key lands. The supporter here runs on the caller's key
+      // on purpose: that pairing IS the access control now.
       res = await fetch(BASE + '/api/work/next', { method: 'POST', headers: auth })
     } catch { break }
     if (res.status !== 200) continue // 204 (no work) or 429 (backoff) -> poll again
@@ -103,7 +69,8 @@ async function supporter(key: string) {
     const last = job.messages.at(-1)?.content ?? ''
     served.push(last)
     if (answerDelayMs) await new Promise((r) => setTimeout(r, answerDelayMs))
-    await post('/api/work/complete', { id: job.id, text: `SUPPORTER_REPLY: ${last}` }, auth)
+    // The ticket, not just the id, is what proves this node took the job.
+    await post('/api/work/complete', { id: job.id, ticket: job.ticket, text: `SUPPORTER_REPLY: ${last}` }, auth)
   }
 }
 
@@ -138,7 +105,10 @@ console.log('\ne2e — failure (a): claude-code with no supporter online -> clea
   // With nothing polling, the message must say so. The other branch (a supporter
   // is here but slow) is asserted further down, and giving the wrong one is how
   // a caller gets told to retry into a supporter who is already answering.
-  t('the 504 names the real reason: nobody is online', /no supporter is online/i.test(j.error?.message ?? ''), j.error?.message)
+  // "nobody at all" and "nobody of yours" carry opposite advice, and the relay
+  // now routes to the caller's own nodes, so the accurate message is the second.
+  t('the 504 names the real reason: no node of your own', /no node of your own/i.test(j.error?.message ?? ''), j.error?.message)
+  t('and it offers the public pool as the way out', /claude-code[/]public/.test(j.error?.message ?? ''))
   // This caller has now given up. Its job must leave with it, or the supporter
   // started further down would spend real model time answering nobody. That is
   // asserted after the worker has been running: see "abandoned job" below.
@@ -181,7 +151,11 @@ console.log('\ne2e — failure (d): provider model with no X-Relaybee-Connection
 }
 
 // --- now bring a supporter online and run the happy path ---------------------
-const workerTask = supporter(supKey)
+// On the caller's own key, because that is the pairing the relay now routes on:
+// a job goes to its requester's queue and only a node holding that same key can
+// take it. supKey stays a different user, which is what the cross-user blob
+// rejection above needed and what the isolation check below needs.
+const workerTask = supporter(KEY)
 await new Promise((r) => setTimeout(r, 300)) // let the worker start polling
 
 console.log('\ne2e — health sees the supporter online')
@@ -229,6 +203,31 @@ t('the slow stream still terminates with [DONE]', sse4.trimEnd().endsWith('data:
 console.log('\ne2e — the abandoned job from failure (a) was never handed to the supporter')
 t('a caller that gave up did not leave work behind', !served.some((s) => s.includes('anyone-home')), JSON.stringify(served))
 
+console.log('\ne2e - a stranger with their own key gets nothing, over real HTTP')
+{
+  // supKey is a different user. Minting one is free and unauthenticated, which
+  // is exactly the position an attacker starts from.
+  const strangerAuth = { authorization: `Bearer ${supKey}`, 'x-forwarded-for': '10.7.7.7', 'content-type': 'application/json' }
+  const callerAsks = post('/api/v1/chat/completions', {
+    model: 'claude-code', messages: [{ role: 'user', content: 'SECRET_PROMPT_FOR_OWNER_ONLY' }],
+  }, clientAuth)
+
+  const drain = await fetch(BASE + '/api/work/next', {
+    method: 'POST', headers: strangerAuth, body: JSON.stringify({ pool: 'public' }),
+  })
+  t('a stranger long-polling gets no job', drain.status === 204, `status=${drain.status}`)
+
+  const answer = await (await callerAsks).json()
+  t('and the node holding the owner key answered it instead',
+    /SUPPORTER_REPLY/.test(answer.choices?.[0]?.message?.content ?? ''),
+    JSON.stringify(answer.choices?.[0]?.message?.content))
+
+  // The caller was handed chatcmpl-<job id>, so the id is public by design.
+  const leakedId = String(answer.id ?? '').replace(/^chatcmpl-/, '')
+  const inject = await post('/api/work/complete', { id: leakedId, ticket: 'made-up', text: 'INJECTED' }, strangerAuth)
+  t('and the leaked job id does not let a stranger write an answer', inject.status === 403, `status=${inject.status}`)
+}
+
 console.log('\ne2e — bring-your-own-keys path against a fake provider')
 // Intercept only the provider endpoint; everything else uses real fetch.
 const realFetch = globalThis.fetch
@@ -259,7 +258,7 @@ t('usage is mapped', j3.usage?.total_tokens === 8)
 
 workerOn = false
 await Promise.race([workerTask, new Promise((r) => setTimeout(r, 100))])
-server.close()
+await closeServer()
 
 console.log(failed === 0 ? '\ne2e: all checks passed\n' : `\ne2e: ${failed} check(s) failed\n`)
 process.exit(failed === 0 ? 0 : 1)

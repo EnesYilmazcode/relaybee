@@ -10,3 +10,10 @@ node_modules/
 
 .vercel
 .env*
+
+# Output of `npm run test:live` — real run data, regenerated on demand.
+telemetry/
+
+# `npm run coverage` output.
+coverage/
+.nyc_output/

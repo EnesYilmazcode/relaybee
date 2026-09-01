@@ -14,7 +14,7 @@ export type ChatRequest = {
   [k: string]: unknown
 }
 
-export type Adapter = {
+type Adapter = {
   id: string
   endpoint: string
   headers(apiKey: string): Record<string, string>
@@ -56,12 +56,18 @@ async function* frames(upstream: ReadableStream<Uint8Array>) {
     const { done, value } = await reader.read()
     if (done) break
     buf += decoder.decode(value, { stream: true })
-    let idx: number
-    while ((idx = buf.indexOf('\n\n')) !== -1) {
-      const raw = buf.slice(0, idx)
-      buf = buf.slice(idx + 2)
+    // A frame ends at a blank line, and the spec allows CRLF as well as LF.
+    // Splitting on LF-LF alone means a CRLF stream never yields a frame at all:
+    // the buffer grows for the whole response and the caller gets a successful,
+    // empty answer. No adapter here sends CRLF today, which is exactly why this
+    // would be found the hard way.
+    const sep = /\r?\n\r?\n/
+    let m: RegExpExecArray | null
+    while ((m = sep.exec(buf)) !== null) {
+      const raw = buf.slice(0, m.index)
+      buf = buf.slice(m.index + m[0].length)
       let data = ''
-      for (const line of raw.split('\n')) {
+      for (const line of raw.split(/\r?\n/)) {
         if (line.startsWith('data:')) data += line.slice(5).trim()
       }
       if (data) yield { data }
@@ -213,7 +219,12 @@ export const ADAPTERS: Record<string, Adapter> = { anthropic, openai, groq }
 export function route(modelString: string): { adapter: Adapter; model: string } | null {
   const i = modelString.indexOf('/')
   if (i === -1) return null
-  const adapter = ADAPTERS[modelString.slice(0, i)]
+  // hasOwn, not a truthy index. ADAPTERS is a plain object, so "constructor/x"
+  // and "__proto__/x" resolved to something truthy off Object.prototype with no
+  // id and no endpoint, and the caller got a confusing 403 about a connection
+  // for provider "undefined" instead of a clean "unknown model" 400.
+  const name = modelString.slice(0, i)
+  const adapter = Object.hasOwn(ADAPTERS, name) ? ADAPTERS[name] : undefined
   const model = modelString.slice(i + 1)
   if (!adapter || !model) return null
   return { adapter, model }
