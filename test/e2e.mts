@@ -254,6 +254,79 @@ t('byo request succeeds', r3.status === 200, `status=${r3.status}`)
 t('provider answer is translated to OpenAI shape', j3.choices?.[0]?.message?.content === 'FAKE_ANTHROPIC_OK', JSON.stringify(j3.choices?.[0] ?? j3))
 t('usage is mapped', j3.usage?.total_tokens === 8)
 
+// --- the terminal CLI --------------------------------------------------------
+// scripts/relaybee.mjs is the terminal half of what the setup page did: mint,
+// seal, compose. It is driven here rather than in smoke because it only speaks
+// HTTP, and this is the file that has a real server on a real port.
+{
+  const { spawn } = await import('node:child_process')
+  const { fileURLToPath } = await import('node:url')
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const cli = fileURLToPath(new URL('../scripts/relaybee.mjs', import.meta.url))
+  const home = mkdtempSync(join(tmpdir(), 'relaybee-cli-'))
+  // RELAYBEE_HOME keeps this out of the developer's real ~/.relaybee, and --base
+  // keeps it off production: the CLI defaults to relaybee.vercel.app, so a
+  // missing --base here would mint real keys against the live service.
+  //
+  // spawn, deliberately not spawnSync. The server the CLI talks to is this same
+  // process, so a synchronous spawn blocks the event loop that would answer it
+  // and every call times out with empty output.
+  const run = (args: string[], stdin = '') => new Promise<{ code: number | null; out: string; err: string }>((resolve) => {
+    const child = spawn(process.execPath, [cli, ...args, '--base', BASE], {
+      env: { ...process.env, RELAYBEE_HOME: home, RELAYBEE_BASE_URL: '' },
+    })
+    let out = '', err = ''
+    child.stdout.setEncoding('utf8'); child.stdout.on('data', (d) => { out += d })
+    child.stderr.setEncoding('utf8'); child.stderr.on('data', (d) => { err += d })
+    const timer = setTimeout(() => child.kill('SIGKILL'), 20_000)
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code, out, err }) })
+    child.stdin.end(stdin)
+  })
+  const firstLine = (s: string) => s.split(String.fromCharCode(10))[0]
+
+  const minted = await run(['mint'])
+  t('cli: mint returns a usable key',
+    minted.code === 0 && minted.out.trim().startsWith('rb_live_'),
+    minted.out.trim().slice(0, 20) || firstLine(minted.err))
+  const key = minted.out.trim()
+
+  // A second mint is a NEW identity, so it orphans every sealed blob. Refusing
+  // is the point: the blobs are bound to the old user id and unrecoverable.
+  const again = await run(['mint'])
+  t('cli: a second mint refuses rather than orphaning the pool',
+    again.code === 1 && /already stored/.test(again.err), firstLine(again.err))
+
+  const sealed = await run(['connect', '--provider', 'anthropic', '--label', 'first'], 'sk-ant-cli-test')
+  t('cli: connect seals a provider key read from stdin',
+    sealed.code === 0 && sealed.out.trim().length > 20,
+    firstLine(sealed.err) || sealed.out.slice(0, 40))
+  const blob = sealed.out.trim()
+
+  const noStdin = await run(['connect', '--provider', 'anthropic'])
+  t('cli: and refuses a key on argv, which would land in shell history',
+    noStdin.code === 1 && /stdin/.test(noStdin.err), firstLine(noStdin.err))
+
+  const env = await run(['config'])
+  t('cli: config composes the base, the key and the connection',
+    env.out.includes(BASE + '/api/v1') && env.out.includes(key) && env.out.includes(blob),
+    env.out.slice(0, 80))
+  const curl = await run(['config', '--shape', 'curl'])
+  t('cli: and every shape carries the connection header',
+    curl.out.includes('X-Relaybee-Connection: ' + blob), curl.out.slice(0, 80))
+  const bad = await run(['config', '--shape', 'nope'])
+  t('cli: an unknown shape is refused, not silently treated as env',
+    bad.code === 1 && /Unknown shape/.test(bad.err), firstLine(bad.err))
+
+  // The gateway answers 400 above MAX_POOL, so composing a bigger header would
+  // hand the caller a config that cannot work.
+  for (let i = 1; i < 8; i++) await run(['connect', '--provider', 'anthropic'], 'sk-ant-fill-' + i)
+  const ninth = await run(['connect', '--provider', 'anthropic'], 'sk-ant-ninth')
+  t('cli: the pool cap is the gateway one, so a ninth connection is refused',
+    ninth.code === 1 && /already holds 8/.test(ninth.err), firstLine(ninth.err))
+}
+
 // --- teardown ----------------------------------------------------------------
 
 workerOn = false
