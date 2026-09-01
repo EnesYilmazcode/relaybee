@@ -16,11 +16,13 @@
 import { verifyKey, bearer } from '../../lib/auth'
 import { nextJob, markLive, issueTicket } from '../../lib/queue'
 import { check, clientIp, rlHeaders } from '../../lib/ratelimit'
+import { corsFor } from '../../lib/cors'
 
 export const config = { runtime: 'edge' }
 
-const CORS = {
-  'access-control-allow-origin': '*',
+const cors = (req: Request) => corsFor(req, CORS_BASE)
+
+const CORS_BASE = {
   'access-control-allow-headers': 'authorization, content-type',
   'access-control-allow-methods': 'POST, OPTIONS',
   'access-control-expose-headers': 'x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-reset',
@@ -55,24 +57,24 @@ function shouldBeat(userId: string): boolean {
 }
 
 export default async function handler(req: Request): Promise<Response> {
-  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS })
+  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors(req) })
   if (req.method !== 'POST') {
     return new Response(JSON.stringify({ error: { message: 'Use POST.' } }), {
-      status: 405, headers: { 'content-type': 'application/json', ...CORS },
+      status: 405, headers: { 'content-type': 'application/json', ...cors(req) },
     })
   }
 
   const auth = await verifyKey(bearer(req))
   if (!auth) {
     return new Response(JSON.stringify({ error: { message: 'Missing or invalid Relaybee API key.', type: 'authentication_error' } }), {
-      status: 401, headers: { 'content-type': 'application/json', ...CORS },
+      status: 401, headers: { 'content-type': 'application/json', ...cors(req) },
     })
   }
   const rl = check(`poll:${clientIp(req)}`, IP_POLL_LIMIT)
   const rlh = rlHeaders(rl)
   if (!rl.ok) {
     return new Response(JSON.stringify({ error: { message: 'Polling too fast. One request at a time is enough — each holds for 15s.', type: 'rate_limit_error' } }), {
-      status: 429, headers: { 'content-type': 'application/json', ...CORS, ...rlh },
+      status: 429, headers: { 'content-type': 'application/json', ...cors(req), ...rlh },
     })
   }
 
@@ -91,19 +93,19 @@ export default async function handler(req: Request): Promise<Response> {
     if (shouldBeat(auth.u)) await markLive(auth.u, wantsPublic)
 
     const job = await nextJob(POLL_WINDOW_MS, auth.u, wantsPublic)
-    if (!job) return new Response(null, { status: 204, headers: { ...CORS, ...rlh } })
+    if (!job) return new Response(null, { status: 204, headers: { ...cors(req), ...rlh } })
 
     // Issued here, to this key, for this job. Recomputed on delivery, so no
     // storage and no extra queue command.
     const ticket = await issueTicket(job.id, auth.u)
     return new Response(JSON.stringify({ ...job, ticket }), {
-      headers: { 'content-type': 'application/json', ...CORS, ...rlh },
+      headers: { 'content-type': 'application/json', ...cors(req), ...rlh },
     })
   } catch {
     // The queue backend (Upstash) is unreachable. Return a JSON/CORS envelope
     // the worker loop can read instead of a bare 500 with no headers.
     return new Response(JSON.stringify({ error: { message: 'Relay queue is temporarily unavailable.', type: 'server_error' } }), {
-      status: 503, headers: { 'content-type': 'application/json', ...CORS, ...rlh },
+      status: 503, headers: { 'content-type': 'application/json', ...cors(req), ...rlh },
     })
   }
 }

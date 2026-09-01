@@ -3,11 +3,13 @@
 import { issueKey } from '../../lib/auth'
 import { check, clientIp, IP_ISSUE_LIMIT } from '../../lib/ratelimit'
 import { hasSecrets, NOT_CONFIGURED } from '../../lib/config'
+import { corsFor } from '../../lib/cors'
 
 export const config = { runtime: 'edge' }
 
-const CORS = {
-  'access-control-allow-origin': '*',
+const cors = (req: Request) => corsFor(req, CORS_BASE)
+
+const CORS_BASE = {
   'access-control-allow-headers': 'content-type',
   'access-control-allow-methods': 'POST, OPTIONS',
 }
@@ -20,17 +22,17 @@ export default async function handler(req: Request): Promise<Response> {
     // with CORS, never a bare platform error page.
     return new Response(
       JSON.stringify({ error: { message: 'Internal error issuing a key.', type: 'api_error' } }),
-      { status: 500, headers: { 'content-type': 'application/json', ...CORS } },
+      { status: 500, headers: { 'content-type': 'application/json', ...cors(req) } },
     )
   }
 }
 
 async function handleIssue(req: Request): Promise<Response> {
-  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS })
+  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors(req) })
   if (req.method !== 'POST') {
     return new Response(JSON.stringify({ error: { message: 'Use POST.' } }), {
       status: 405,
-      headers: { 'content-type': 'application/json', ...CORS },
+      headers: { 'content-type': 'application/json', ...cors(req) },
     })
   }
 
@@ -39,7 +41,7 @@ async function handleIssue(req: Request): Promise<Response> {
   if (!hasSecrets('MASTER_SECRET')) {
     return new Response(
       JSON.stringify({ error: { message: NOT_CONFIGURED, type: 'api_error' } }),
-      { status: 503, headers: { 'content-type': 'application/json', ...CORS } },
+      { status: 503, headers: { 'content-type': 'application/json', ...cors(req) } },
     )
   }
 
@@ -49,7 +51,7 @@ async function handleIssue(req: Request): Promise<Response> {
   if (!check(`issue:${clientIp(req)}`, IP_ISSUE_LIMIT).ok) {
     return new Response(
       JSON.stringify({ error: { message: 'Too many keys requested from this source. Try again shortly.', type: 'rate_limit_error' } }),
-      { status: 429, headers: { 'content-type': 'application/json', ...CORS } },
+      { status: 429, headers: { 'content-type': 'application/json', ...cors(req) } },
     )
   }
 
@@ -75,6 +77,6 @@ async function handleIssue(req: Request): Promise<Response> {
       expires_in_days: 90,
       note: 'Store this now. Relaybee keeps no record of it and cannot show it again.',
     }),
-    { headers: { 'content-type': 'application/json', ...CORS } },
+    { headers: { 'content-type': 'application/json', ...cors(req) } },
   )
 }

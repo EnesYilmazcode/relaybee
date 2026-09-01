@@ -8,11 +8,13 @@
 import { verifyKey, bearer } from '../../lib/auth'
 import { isLive, countLive } from '../../lib/queue'
 import { check, clientIp, rlHeaders } from '../../lib/ratelimit'
+import { corsFor } from '../../lib/cors'
 
 export const config = { runtime: 'edge' }
 
-const CORS = {
-  'access-control-allow-origin': '*',
+const cors = (req: Request) => corsFor(req, CORS_BASE)
+
+const CORS_BASE = {
   'access-control-allow-headers': 'authorization, content-type',
   'access-control-allow-methods': 'GET, OPTIONS',
   'access-control-expose-headers': 'x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-reset',
@@ -43,15 +45,15 @@ async function onlineCount(): Promise<number> {
 // never land in a shared cache where another caller could be served it.
 const CACHE_CONTROL = 'private, no-store'
 
-function json(status: number, obj: unknown, extra: Record<string, string> = {}) {
-  return new Response(JSON.stringify(obj), {
+const jsonFor = (req: Request) => (status: number, obj: unknown, extra: Record<string, string> = {}) =>
+  new Response(JSON.stringify(obj), {
     status,
-    headers: { 'content-type': 'application/json', 'cache-control': CACHE_CONTROL, ...CORS, ...extra },
+    headers: { 'content-type': 'application/json', 'cache-control': CACHE_CONTROL, ...cors(req), ...extra },
   })
-}
 
 export default async function handler(req: Request): Promise<Response> {
-  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS })
+  const json = jsonFor(req)
+  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors(req) })
   if (req.method !== 'GET') return json(405, { error: { message: 'Use GET.' } })
 
   const auth = await verifyKey(bearer(req))

@@ -105,6 +105,7 @@ the relay's direction (P0 in Next, and two of its three legs have moved), whethe
 | 84 | Presence recorded per pool, so a `claude-code/public` caller is held only when a node has opted into that pool | `fix(relay)` (#100) |
 | 85 | Two more assertions that could not fail made real, bringing the round's total of vacuous checks to six | `test` (#100) |
 | 86 | `SECURITY.md` and `lib/queue.ts` stopped calling the job id the capability, which the ticket replaced | `docs` (#100) |
+| 87 | The endpoints that hand back a key or a job answer named origins instead of `*`, so a page a visitor loads can no longer read a minted key out of their browser | `fix(web)` (#101) |
 
 ### Resolved: Relaybee is a personal capacity router
 
@@ -411,6 +412,41 @@ Honest list. None of these are bugs; all are consequences of choices above.
 ---
 
 ## Changelog
+
+### 2026-09-01 (the endpoints that hand back a capability stopped answering every origin)
+
+[#101](https://github.com/EnesYilmazcode/relaybee/pull/101), closing
+[#96](https://github.com/EnesYilmazcode/relaybee/issues/96). `/api/keys/issue` and `/api/work/*`
+replied to every origin with `access-control-allow-origin: *`. Minting is an unauthenticated
+simple POST, so it never triggers a preflight that could refuse: any page a visitor loaded could
+mint a key in their browser and poll the relay from their IP with no interaction. `lib/cors.ts`
+now reflects an allow-listed origin and otherwise sends no `access-control-allow-origin` at all,
+so a browser refuses to expose the body while same-origin traffic is untouched. The list is read
+per call, not at module scope, so a warm instance picks up a change. `vary: origin` is not
+decoration: without it a shared cache could serve one origin's reflected header to another. The
+proxy path and `/api/health` keep their wildcard on purpose, and an assertion pins that split so
+it reads as a decision rather than a spot someone missed.
+
+Two things are worth stating precisely, because the first write-up of this overstated both.
+
+- **What the fix removes is the browser amplifier, not the drive-by itself.** The hostile page's
+  request still *executes* cross-origin, because a CORS-simple POST always does. It can still burn
+  a visitor's ten-key IP budget from their address. What it can no longer do is *read the
+  response*, which is where the key is. "Any page can mint a key in a visitor's browser" was true
+  before and is half-true after.
+- **The relay assertions were one-directional, and that hid three live regressions.** Checking
+  only that a stranger gets `null` cannot tell a working allowlist from an endpoint that never
+  received the request, or one answering a bare 204 with no CORS at all. Both return `null`. An
+  adversarial review mutated the code ten ways: seven were caught, and the three that were not
+  were exactly a prefix match instead of an exact one (`https://friend.example.evil.example`
+  reflected), `corsFor` passed `undefined` on both relay endpoints, and a bare-204 preflight.
+  `api/work/complete.ts` had no CORS assertion at all despite being one of the four files changed
+  and the endpoint that delivers the answer. All three mutations now fail the suite, all three
+  relay endpoints are pinned in both directions, and exact-versus-prefix matching has its own
+  check. Smoke is **347 assertions**, up from 336.
+
+`RELAYBEE_ALLOWED_ORIGINS` is a new operator knob and is documented in `README.md` under Honest
+limits. It is empty by default, which means same-origin only.
 
 ### 2026-09-01 (a live API key was committed to this repo, and the pasted brief had no containment)
 
