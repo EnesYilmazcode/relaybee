@@ -151,9 +151,9 @@ export function parseAgent(raw) {
 export class AgentFailed extends Error {}
 
 /** Run the local agent on a prompt. Resolves to { text, usage }, or throws. */
-function ask(prompt, cwd) {
+export function ask(prompt, cwd, spawnAgent = spawn) {
   return new Promise((resolve, reject) => {
-    const child = spawn(AGENT, agentArgs(), { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
+    const child = spawnAgent(AGENT, agentArgs(), { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
     let out = '', errOut = ''
     const timer = setTimeout(() => { child.kill(); reject(new Error(`agent timed out after ${ANSWER_TIMEOUT_MS}ms`)) }, ANSWER_TIMEOUT_MS)
     child.stdout.on('data', (d) => { out += d })
@@ -161,7 +161,8 @@ function ask(prompt, cwd) {
     child.on('error', (e) => { clearTimeout(timer); reject(e) })
     child.on('close', (code) => {
       clearTimeout(timer)
-      const parsed = parseAgent(out)
+      let parsed
+      try { parsed = parseAgent(out) } catch (e) { return reject(e) }
       if (code !== 0 && !parsed.text) return reject(new Error(`agent exited ${code}: ${errOut.trim().slice(0, 200) || 'no output'}`))
       parsed.text ? resolve(parsed) : reject(new Error('agent returned nothing'))
     })
@@ -342,6 +343,7 @@ async function main() {
     } catch (e) {
       log('deliver failed:', e.message)
       await telemetry({ event: 'deliver_error', jobId: job.id, message: e.message })
+      if (stopAfterThis) break
       continue
     }
     const deliveredAt = now()

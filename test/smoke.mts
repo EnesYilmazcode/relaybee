@@ -1193,6 +1193,24 @@ console.log('%ssupporter script - the flags that bound spend actually parse', St
     ], { encoding: 'utf8', timeout: 20_000, env: { ...process.env, ENV_IN: envelope } })
     return ((r.stdout ?? '') + (r.stderr ?? '')).trim()
   }
+  const askCase = (envelope: string) => {
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `import { EventEmitter } from 'node:events';` +
+      `import { ask } from ${JSON.stringify(pathToFileURL(script).href)};` +
+      `const fakeSpawn = () => {` +
+      ` const child = new EventEmitter();` +
+      ` child.stdout = new EventEmitter(); child.stderr = new EventEmitter();` +
+      ` child.kill = () => {};` +
+      ` child.stdin = { end() { queueMicrotask(() => {` +
+      `   child.stdout.emit('data', process.env.ENV_IN); child.emit('close', 0);` +
+      ` }) } };` +
+      ` return child;` +
+      `};` +
+      `try { const r = await ask('prompt', '.', fakeSpawn); console.log('OK:' + r.text) }` +
+      `catch (e) { console.log(e.constructor.name + ':' + e.message) }`,
+    ], { encoding: 'utf8', timeout: 20_000, env: { ...process.env, ENV_IN: envelope } })
+    return { code: r.status, out: ((r.stdout ?? '') + (r.stderr ?? '')).trim() }
+  }
   t('a credit failure is not delivered as the answer',
     parseCase('{"type":"result","subtype":"success","is_error":true,"result":"Credit balance is too low"}')
       === 'AgentFailed:Credit balance is too low')
@@ -1206,6 +1224,14 @@ console.log('%ssupporter script - the flags that bound spend actually parse', St
     parseCase('{"type":"result","subtype":"success","is_error":false,"result":"Paris."}') === 'OK:Paris.')
   t('and plain output with no envelope is still the answer',
     parseCase('just words') === 'OK:just words')
+  const failedAsk = askCase('{"type":"result","subtype":"success","is_error":true,"result":"Credit balance is too low"}')
+  t('an agent-reported failure rejects ask instead of escaping its close callback',
+    failedAsk.code === 0 && failedAsk.out === 'AgentFailed:Credit balance is too low',
+    failedAsk.out || `exit=${failedAsk.code}`)
+  const goodAsk = askCase('{"type":"result","subtype":"success","is_error":false,"result":"Paris."}')
+  t('and ask still resolves a good envelope through the child-process boundary',
+    goodAsk.code === 0 && goodAsk.out === 'OK:Paris.',
+    goodAsk.out || `exit=${goodAsk.code}`)
 
   const noCap = runSupporter('--own-traffic-only', '--max-jobs')
   t('and --max-jobs with no number stops the node instead of uncapping it',
