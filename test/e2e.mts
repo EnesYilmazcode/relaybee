@@ -261,7 +261,7 @@ t('usage is mapped', j3.usage?.total_tokens === 8)
 {
   const { spawn } = await import('node:child_process')
   const { fileURLToPath } = await import('node:url')
-  const { mkdtempSync } = await import('node:fs')
+  const { mkdtempSync, readFileSync, writeFileSync } = await import('node:fs')
   const { tmpdir } = await import('node:os')
   const { join } = await import('node:path')
   const cli = fileURLToPath(new URL('../scripts/relaybee.mjs', import.meta.url))
@@ -273,8 +273,8 @@ t('usage is mapped', j3.usage?.total_tokens === 8)
   // spawn, deliberately not spawnSync. The server the CLI talks to is this same
   // process, so a synchronous spawn blocks the event loop that would answer it
   // and every call times out with empty output.
-  const run = (args: string[], stdin = '') => new Promise<{ code: number | null; out: string; err: string }>((resolve) => {
-    const child = spawn(process.execPath, [cli, ...args, '--base', BASE], {
+  const run = (args: string[], stdin = '', base = BASE) => new Promise<{ code: number | null; out: string; err: string }>((resolve) => {
+    const child = spawn(process.execPath, [cli, ...args, '--base', base], {
       env: { ...process.env, RELAYBEE_HOME: home, RELAYBEE_BASE_URL: '' },
     })
     let out = '', err = ''
@@ -303,6 +303,48 @@ t('usage is mapped', j3.usage?.total_tokens === 8)
     sealed.code === 0 && sealed.out.trim().length > 20,
     firstLine(sealed.err) || sealed.out.slice(0, 40))
   const blob = sealed.out.trim()
+
+  // A damaged store must stop the command before it mints a new identity. The
+  // old key and connection blobs exist only in this file and are unrecoverable.
+  const storeFile = join(home, 'credentials.json')
+  const validStore = readFileSync(storeFile, 'utf8')
+  const malformedStore = '{not json\n'
+  writeFileSync(storeFile, malformedStore)
+  const corrupt = await run(['mint'])
+  t('cli: malformed credentials are refused without replacing the file',
+    corrupt.code === 1 && /Invalid JSON in credential store/.test(corrupt.err) &&
+      readFileSync(storeFile, 'utf8') === malformedStore,
+    firstLine(corrupt.err))
+
+  const wrongShape = '{}\n'
+  writeFileSync(storeFile, wrongShape)
+  const invalid = await run(['mint'])
+  t('cli: structurally invalid credentials are refused without replacing the file',
+    invalid.code === 1 && /Invalid credential store/.test(invalid.err) &&
+      readFileSync(storeFile, 'utf8') === wrongShape,
+    firstLine(invalid.err))
+  writeFileSync(storeFile, validStore)
+
+  const malformedApi = await serveRoutes({
+    'POST /api/keys/issue': () => Response.json({}),
+  })
+  const badMint = await run(['mint', '--force'], '', malformedApi.base)
+  await malformedApi.close()
+  t('cli: an invalid mint response cannot replace existing credentials',
+    badMint.code === 1 && /invalid success response/.test(badMint.err) &&
+      readFileSync(storeFile, 'utf8') === validStore,
+    firstLine(badMint.err))
+
+  const malformedConnectApi = await serveRoutes({
+    'POST /api/connect': () => Response.json({}),
+  })
+  const badConnect = await run(
+    ['connect', '--provider', 'anthropic'], 'sk-ant-test', malformedConnectApi.base)
+  await malformedConnectApi.close()
+  t('cli: an invalid connect response cannot replace existing credentials',
+    badConnect.code === 1 && /invalid success response/.test(badConnect.err) &&
+      readFileSync(storeFile, 'utf8') === validStore,
+    firstLine(badConnect.err))
 
   const noStdin = await run(['connect', '--provider', 'anthropic'])
   t('cli: and refuses a key on argv, which would land in shell history',

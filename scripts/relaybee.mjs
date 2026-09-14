@@ -14,7 +14,8 @@
 // The store lives at ~/.relaybee/credentials.json, or $RELAYBEE_HOME if set.
 
 import { parseArgs } from 'node:util'
-import { readFile, writeFile, mkdir, chmod } from 'node:fs/promises'
+import { readFile, writeFile, mkdir, chmod, rename, unlink } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -54,19 +55,43 @@ const storeDir = () => process.env.RELAYBEE_HOME || join(homedir(), '.relaybee')
 const storePath = () => join(storeDir(), 'credentials.json')
 
 async function readStore() {
+  let raw
   try {
-    return JSON.parse(await readFile(storePath(), 'utf8'))
-  } catch {
-    return { connections: [] }
+    raw = await readFile(storePath(), 'utf8')
+  } catch (e) {
+    if (e?.code === 'ENOENT') return { connections: [] }
+    throw new Error(`Could not read credential store at ${storePath()}: ${e.message}`)
   }
+
+  let store
+  try {
+    store = JSON.parse(raw)
+  } catch (e) {
+    throw new Error(`Invalid JSON in credential store at ${storePath()}: ${e.message}`)
+  }
+  if (!store || typeof store !== 'object' || Array.isArray(store) ||
+      typeof store.key !== 'string' || !store.key ||
+      typeof store.userId !== 'string' || !store.userId ||
+      !Array.isArray(store.connections) || store.connections.some((c) => typeof c !== 'string') ||
+      (store.base !== undefined && typeof store.base !== 'string')) {
+    throw new Error(`Invalid credential store at ${storePath()}: expected key, userId and a connections array`)
+  }
+  return store
 }
 
 async function writeStore(s) {
   await mkdir(storeDir(), { recursive: true })
-  await writeFile(storePath(), JSON.stringify(s, null, 2) + '\n', 'utf8')
-  // Best effort. Windows ACLs do not map onto a POSIX mode, so this is a no-op
-  // there rather than a guarantee, and the file holds a bearer token.
-  await chmod(storePath(), 0o600).catch(() => {})
+  const temp = `${storePath()}.${process.pid}.${randomUUID()}.tmp`
+  try {
+    await writeFile(temp, JSON.stringify(s, null, 2) + '\n', { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+    // Best effort. Windows ACLs do not map onto a POSIX mode, so this is a no-op
+    // there rather than a guarantee, and the file holds a bearer token.
+    await chmod(temp, 0o600).catch(() => {})
+    await rename(temp, storePath())
+  } catch (e) {
+    await unlink(temp).catch(() => {})
+    throw e
+  }
 }
 
 async function call(base, path, body, key) {
@@ -162,10 +187,10 @@ async function main() {
   const cmd = positionals[0]
   if (v.help || !cmd) { out(USAGE); return }
 
+  if (cmd === 'where') { out(storePath()); return }
+
   const store = await readStore()
   const base = (v.base ?? process.env.RELAYBEE_BASE_URL ?? store.base ?? DEFAULT_BASE).replace(/\/$/, '')
-
-  if (cmd === 'where') { out(storePath()); return }
 
   if (cmd === 'mint') {
     // Every mint gets a fresh random user id (api/keys/issue.ts), and a sealed
@@ -179,6 +204,9 @@ async function main() {
     }
     const r = await call(base, '/api/keys/issue', {})
     if (!r) return
+    if (typeof r.key !== 'string' || !r.key || typeof r.user_id !== 'string' || !r.user_id) {
+      return die('/api/keys/issue returned an invalid success response; existing credentials were not changed')
+    }
     const dropped = store.key ? store.connections.length : 0
     await writeStore({ base, key: r.key, userId: r.user_id, connections: [] })
     out(r.key)
@@ -202,6 +230,9 @@ async function main() {
     const r = await call(base, '/api/connect',
       { provider: v.provider, apiKey, label: v.label ?? v.provider }, store.key)
     if (!r) return
+    if (typeof r.connection !== 'string' || !r.connection) {
+      return die('/api/connect returned an invalid success response; existing credentials were not changed')
+    }
     store.base = base
     store.connections.push(r.connection)
     await writeStore(store)
