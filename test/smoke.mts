@@ -607,38 +607,46 @@ t('connect: a forced error returns a clean 500', connectErr.status === 500)
 t('connect: the error path keeps CORS', connectErr.headers.get('access-control-allow-origin') === '*')
 t('connect: the error path carries a {message,type} envelope', typeof connectErrJson.error?.message === 'string' && typeof connectErrJson.error?.type === 'string')
 
-console.log('\npublic pool — one caller cannot take a volunteer\'s whole allowance')
+console.log('\npublic pool — repeated submissions are throttled on one warm instance')
 // The general limit meters a caller against Relaybee's quota. A public-pool job
 // spends a volunteer's API key instead, which is why it needs its own smaller
-// budget. Drive the bucket to its edge first: the cap is charged before the job
-// is queued, so a refused call returns at once instead of holding the relay's
-// 20s window open, and the test costs no wall-clock.
+// per-instance threshold. Drive the bucket to its edge first: the throttle is
+// charged before queueing, so a refusal returns at once instead of holding the
+// relay's 20s window open, and the test costs no wall-clock.
 {
   const { check, PUBLIC_POOL_LIMIT, LIMITS } = await import('../lib/ratelimit.ts')
   const capUser = 'pool_cap_user'
   const capKey = await issueKey(capUser)
-  const publicReq = () => new Request('https://x/api/v1/chat/completions', {
+  const publicReq = (key = capKey, ip?: string) => new Request('https://x/api/v1/chat/completions', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${capKey}` },
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}`, ...(ip ? { 'x-real-ip': ip } : {}) },
     body: JSON.stringify({ model: 'claude-code/public', messages: [{ role: 'user', content: 'cap' }] }),
   })
 
-  t('the public pool is capped well below the general limit', PUBLIC_POOL_LIMIT < LIMITS.free,
+  t('the public-pool threshold is below the general per-instance limit', PUBLIC_POOL_LIMIT < LIMITS.free,
     `public=${PUBLIC_POOL_LIMIT} general=${LIMITS.free}`)
 
-  // Spend the caller's public budget without going through the handler, so the
-  // assertion below is about the cap and not about queue timing.
+  // Spend the key's per-instance threshold without going through the handler,
+  // so the assertion below is about the throttle and not about queue timing.
   check(`public:${capUser}`, PUBLIC_POOL_LIMIT, PUBLIC_POOL_LIMIT)
   const refused = await chatCompletions(publicReq())
-  t('a caller over the public-pool budget is refused', refused.status === 429, `status=${refused.status}`)
+  t('a key over this instance\'s public-pool threshold is refused', refused.status === 429, `status=${refused.status}`)
   const refusedBody = await refused.json()
   t('and told to use their own node instead, which is the un-capped path',
     /claude-code/.test(refusedBody.error?.message ?? '') && refusedBody.error?.type === 'rate_limit_error')
   t('the refusal carries rate-limit headers a client can read',
     refused.headers.get('x-ratelimit-limit') === String(PUBLIC_POOL_LIMIT))
 
-  // The cap is on the public pool alone: a caller's own node is their own spend,
-  // so exhausting the public budget must not close the path they actually own.
+  const capIp = '203.0.113.24'
+  const ipUser = 'pool_cap_ip_user'
+  const ipKey = await issueKey(ipUser)
+  check(`public-ip:${capIp}`, PUBLIC_POOL_LIMIT, PUBLIC_POOL_LIMIT)
+  const refusedIp = await chatCompletions(publicReq(ipKey, capIp))
+  t('a source over this instance\'s public-pool threshold is refused even with a fresh key',
+    refusedIp.status === 429, `status=${refusedIp.status}`)
+
+  // The throttle is on the public pool alone: a caller's own node is their own
+  // spend, so exhausting the public threshold must not close the path they own.
   // Driven through the real handler with a node of their own answering, because
   // the claim is about the handler's routing and reading a bucket would not test
   // it. The node earns its keep twice: with nobody answering, this call holds the
@@ -651,7 +659,7 @@ console.log('\npublic pool — one caller cannot take a volunteer\'s whole allow
   }))
   const cycled = await supporterCycle(undefined, capSupporter, 'own')
   const ownAfter = await ownReq
-  t('and the caller\'s own pool still answers after the public budget is gone',
+  t('and the caller\'s own pool still answers after the public threshold is exhausted',
     ownAfter.status === 200, `status=${ownAfter.status} node=${cycled.polled}`)
 }
 

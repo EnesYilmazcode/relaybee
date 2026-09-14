@@ -3,9 +3,9 @@
 // This is deliberately not distributed. Relaybee has no datastore, so the counter
 // lives in module scope on whatever warm edge instance served the request — a
 // user spread across regions gets roughly N-regions times the limit, and a cold
-// start resets to zero. That is fine for what this protects: our own invocation
-// and bandwidth quota, not the user's provider spend (they pay for that with
-// their own key). Swap in Upstash keyed on userId if you ever need it exact.
+// start resets to zero. That is sufficient for the service quotas most limits
+// here protect. The public-pool throttle below is explicitly best effort and
+// cannot bound provider spend across instances. Use Upstash if that must be exact.
 
 type Window = { count: number; resetAt: number }
 
@@ -61,19 +61,19 @@ export function check(userId: string, limit: number, cost = 1): Verdict {
 export const LIMITS: Record<string, number> = { free: 20 }
 
 /**
- * Public-pool submissions, per caller, per minute.
+ * Public-pool submissions, per warm instance, per key and source, per minute.
  *
  * `LIMITS.free` meters a caller against Relaybee's own invocation quota. This
  * meters them against a *volunteer's* API bill, which is a different budget and
  * a far smaller one, so it cannot be the same number. A node answers serially
- * and measured answers ran 4s to 283s, so one caller sending 20 a minute
- * oversubscribes any single supporter by an order of magnitude and can spend
- * their whole job allowance before anyone else is served.
+ * and measured answers ran 4s to 283s, so repeated submissions can oversubscribe
+ * a supporter by an order of magnitude on one warm instance.
  *
  * Four still exceeds what one node can work through in a minute, so it does not
- * constrain honest use; it bounds how much of a stranger's budget one caller
- * can claim. The node-side bounds stay the real ceiling on total spend. This is
- * the fairness half, which is the half no volunteer can enforce for themselves.
+ * constrain honest use. It reduces burst monopolisation on the same instance,
+ * but cold starts and other edge instances have separate counters, so it is not
+ * a global fairness or spend bound. Node-side limits remain the only ceiling on
+ * a volunteer's total.
  */
 export const PUBLIC_POOL_LIMIT = 4
 
