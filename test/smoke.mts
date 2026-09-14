@@ -1276,6 +1276,7 @@ console.log('%ssupporter script - the flags that bound spend actually parse', St
   const { spawnSync } = await import('node:child_process')
   const { fileURLToPath, pathToFileURL } = await import('node:url')
   const script = fileURLToPath(new URL('../scripts/supporter.mjs', import.meta.url))
+  const supporterSource = readFileSync(script, 'utf8')
   const runSupporter = (...args: string[]) => {
     const r = spawnSync(process.execPath, [script, '--base', 'http://127.0.0.1:1', ...args], {
       encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL',
@@ -1339,6 +1340,11 @@ console.log('%ssupporter script - the flags that bound spend actually parse', St
   t('and ask still resolves a good envelope through the child-process boundary',
     goodAsk.code === 0 && goodAsk.out === 'OK:Paris.',
     goodAsk.out || `exit=${goodAsk.code}`)
+
+  const deliveryCatch = supporterSource.match(
+    /catch \(e\) \{\s*log\('deliver failed:'[\s\S]*?\n    \}/)?.[0] ?? ''
+  t('a fatal agent failure stops even when its fallback answer cannot be delivered',
+    /if \(stopAfterThis\) break\s*continue/.test(deliveryCatch))
 
   const noCap = runSupporter('--own-traffic-only', '--max-jobs')
   t('and --max-jobs with no number stops the node instead of uncapping it',
