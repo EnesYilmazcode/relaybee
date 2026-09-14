@@ -11,7 +11,7 @@ decision: whether to rotate `MASTER_SECRET` over the key leaked in `test_ascii_a
 key is valid until 2026-10-31 and rotation is the only lever, which invalidates every key in
 existence.
 **Live URL:** https://relaybee.vercel.app
-**Last updated:** 2026-09-01
+**Last updated:** 2026-09-13
 
 ---
 
@@ -483,6 +483,14 @@ Honest list. None of these are bugs; all are consequences of choices above.
 ---
 
 ## Changelog
+
+### 2026-09-13 (malformed provider messages fail at the request boundary)
+
+Provider-routed requests now reject non-object entries in `messages` with a clean 400 before
+adapter translation or any upstream call. The relay path already handled a null entry without
+throwing, but the provider path reached `lib/providers.ts`, where property access threw and the
+last-line handler returned a generic 500. Smoke coverage now pins the shared boundary for both an
+empty array and a null element. See #112.
 
 ### 2026-09-01 (the relay's direction, decided against the facts rather than the issue's)
 
