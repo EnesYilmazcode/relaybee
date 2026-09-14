@@ -108,6 +108,7 @@ existence.
 | 85 | Two more assertions that could not fail made real, bringing the round's total of vacuous checks to six | `test` (#100) |
 | 86 | `SECURITY.md` and `lib/queue.ts` stopped calling the job id the capability, which the ticket replaced | `docs` (#100) |
 | 87 | The endpoints that hand back a key or a job answer named origins instead of `*`, so a page a visitor loads can no longer read a minted key out of their browser | `fix(web)` (#101) |
+| 88 | The public pool has a best-effort per-instance throttle per key and source, reducing repeated claims on volunteer capacity; the two spend figures the board quotes are pinned rather than grepped for | `fix(relay)` (#103) |
 
 ### Resolved: Relaybee is a personal capacity router
 
@@ -162,12 +163,11 @@ neither survives. Recorded here because the issue is the wrong place to look for
   `test/smoke.mts:891,897,1048` are substring greps for `--max-budget-usd`, `MAXJOBS` and the
   words "Stop after 100 jobs". Neither number is asserted, so raising either one keeps
   `npm run check` green.
-  **The server-side cap the issue actually asked for does not exist**, and the harm it named is
-  live: a caller can still submit 20 jobs a minute (`lib/ratelimit.ts:61`) into one shared
-  `PUBLIC_QUEUE` with no per-caller fairness (`lib/queue.ts:54,369`), and minting is free
-  (`lib/ratelimit.ts:91`). The server does meter, but it meters *rate*, not *total*:
-  `IP_POLL_LIMIT` and `IP_COMPLETE_LIMIT` bound how fast a node is handed and can return work.
-  Nothing server-side bounds how much work a volunteer is offered in total.
+  **A best-effort server-side throttle now exists** (#103): `PUBLIC_POOL_LIMIT` allows four
+  public-pool submissions a minute per key and source on each warm edge instance, charged before
+  the job is queued. It reduces single-source bursts but is not a global caller or spend bound:
+  cold starts, regions and distributed callers have separate counters. Node-side bounds remain
+  the only total-spend ceiling.
   The third prerequisite, an Upstash plan fitting more than one supporter, is untouched.
 
 **What the decision actually accepts.** The one leg still standing is the third: answering
@@ -181,10 +181,11 @@ is accepted rather than solved: real `claude -p` answers ranged from 4s to 283s 
 streaming ceiling, so a volunteer pays for some answers that arrive too late to be delivered.
 #59 moved that ceiling a long way and cannot remove it.
 
-**Still open, and deliberately not built.** A per-caller cap on the public pool. One caller can
-take a volunteer's whole job allowance, and on the pasted-brief path nothing but an instruction
-stops the loop at all. This is the one piece of option A that a decision to keep the pool does
-not settle, so it stays on the board rather than being written off.
+**A best-effort throttle was built straight after, in #103.** It reduces how quickly one source
+can consume the public pool on a warm instance; it does not settle hard global fairness or spend.
+What is still true and is accepted: on the pasted-brief path the job count is an instruction to
+an agent rather than a loop that stops, so a volunteer's total is only as firm as the agent
+following it.
 
 ### Future products (explicitly separate, each with its real cost)
 
@@ -345,7 +346,7 @@ time it ran, on a branch that was missing #89.
 | Priority | Item | Why |
 |---|---|---|
 | P1 | End-to-end test with a **real** provider key | The largest unverified claim in the repo. The live chain reaches Anthropic and returns a real `request_id`, but no successful completion has ever come back, and `test/e2e.mts` mocks the upstream, so the Anthropic response parsing is only ever checked against a fake written from the docs. One minute and about two cents: `node scripts/verify-provider.mjs` |
-| P2 | Retry budget per request | One bad pool of 8 blobs currently costs 8 upstream calls |
+| P1 | npm client package | Mint/seal/compose-config from the terminal, mirroring the setup page. The self-relay routing itself shipped in #100 and is what `claude-code` already means; what is missing is the terminal-side wrapper, so design for that rather than for the routing |
 | P2 | Record the demo clip for the post | Failover across your own providers — show two keys, kill one |
 | P3 | GitHub OAuth key recovery | **Demoted 2026-08-01.** Its stated justification does not survive the code. The reason given was that a lost key orphans every AAD-bound blob, but user ids are generated randomly at mint time (`api/keys/issue.ts`, `${clean}_${randomUUID}`) and blobs are sealed to that id, so an OAuth-derived id is a different id and opens none of them. It could only help someone who arrived through OAuth on their first ever mint, and there are none. The mechanism stays pre-agreed if identity is ever forced |
 
@@ -384,16 +385,41 @@ The one thing worth knowing before using it is that minting twice is not refresh
 mint gets a fresh random user id (`api/keys/issue.ts`), and a sealed blob is bound to the id that
 sealed it, so a second mint creates a new identity and orphans every stored connection with no way
 to recover them. It refuses without `--force` and says how many would be lost.
+**2026-09-01 · No retry budget on the pool walk. The meter already prices it.**
+The Next table carried "one bad pool of 8 blobs costs 8 upstream calls" from 2026-07-28 (`0920e4e`).
+Two things had already happened to it. Provider statuses that cannot differ between credentials end
+the walk on the first attempt, because `shouldFailover` retries only 401, 403, 429 and 5xx, so a
+malformed request costs one upstream call and not eight. And the per-connection meter that closed the
+key-oracle advisory (`3649d26`, 2026-08-20) charges a pooled request `conns.length` units against
+`IP_PROXY_LIMIT`, which makes upstream calls per minute per source flat at 60 whatever the pool size:
+
+    pool=1  60 requests/min  60 upstream calls/min
+    pool=8   7 requests/min  56 upstream calls/min
+
+So an 8-blob pool is now the cheapest shape a caller can send, and there is nothing left to bound.
+A budget would also not bind the party it is aimed at, since the caller picks the pool size and an
+abuser would send single blobs. And it would break what `public/docs.html` promises, that a pool
+behaves like one key with the combined quota: the walk starts at a random offset, so a budget of 3 on
+a pool of 8 holding 2 live keys fails somewhere between 25% and 50% of the requests that succeed
+today, differently each time. Nondeterministic failover is a worse thing to own than calls the meter
+already prices one for one.
+
+What did come out of looking: both failure exits omitted `x-relaybee-pool-size`, so a walk that
+stopped on its first attempt was indistinguishable from a pool that only ever had one connection.
+Those need opposite fixes, and `lib/seal.ts` drops an unopenable or wrong-provider blob silently, so
+the size is the only thing that tells them apart from outside. Both pool headers now come from one
+builder and every exit carries both.
 
 **2026-09-01 · The public pool stays, opt-in on both ends and empty by default.**
 Settled on #76. Self-relay is the default and is what `claude-code` means; answering strangers
 needs `claude-code/public` from the caller and `{"pool":"public"}` from the node. Kept rather
 than deleted because the terms objection that killed the original design is answered for the
 default path by construction, and what remains is a disclosed risk a volunteer opts into twice.
-Do not read this as "the spend question is closed": the per-caller cap on the public pool is
-still open, and the volunteer-side bounds are defaults on the node, not limits the service
-imposes. If the pool ever has more than a node or two in it, that cap is the thing to build
-before anything else.
+Do not read this as "the spend question is closed". A best-effort per-instance throttle was built
+as #103, but it is a fairness brake rather than a global bound: it reduces bursts on one warm
+instance while cold starts, regions and distributed callers have separate counters. Nothing
+server-side bounds a volunteer's total. That ceiling is still a default on their own machine,
+and on the pasted-brief path it is prose an agent is asked to obey rather than a loop that stops.
 
 **2026-07-30 · Personal capacity router, not a marketplace.**
 Settled by a five-perspective design review (`docs/design/2026-07-30-dashboard-panel.md`).

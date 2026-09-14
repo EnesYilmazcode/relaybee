@@ -353,6 +353,49 @@ t('pool health lists the failed connection', ph.includes(':429'), ph)
 t('pool health lists the winner last', ph.endsWith(':ok'), ph)
 t('attempt count matches the walk', healthRes.headers.get('x-relaybee-attempt') === '2')
 t('pool health is exposed to browsers', (healthRes.headers.get('access-control-expose-headers') ?? '').includes('x-relaybee-pool-health'))
+t('the success path reports the pool size', healthRes.headers.get('x-relaybee-pool-size') === '2', healthRes.headers.get('x-relaybee-pool-size') ?? 'absent')
+
+// Both failure exits used to omit the pool size, so a request that stopped on
+// its first attempt was indistinguishable from one whose pool WAS that single
+// connection. Opposite problems: untried keys left over, versus blobs the
+// routed adapter never matched, which lib/seal.ts drops without saying so.
+// Nothing here asserts WHICH connection was tried, because the walk starts at
+// a random offset (lib/gateway.ts) and every connection in these pools behaves
+// identically, which is what makes the assertions deterministic.
+{
+  const sizeKey = await issueKey('pool_size_user')
+  const three = await Promise.all(['aa', 'bb', 'cc'].map((k, i) => seal(
+    { provider: 'anthropic', apiKey: 'sk-ant-' + k, owner: 'pool_size_user', createdAt: Date.now(), label: 'c' + i })))
+  const poolReq = () => new Request('https://x/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer ' + sizeKey,
+      'x-relaybee-connection': three.join(','),
+    },
+    body: JSON.stringify({ model: 'anthropic/claude-opus-5', messages: [{ role: 'user', content: 'size' }] }),
+  })
+  const saved = globalThis.fetch
+
+  // 400 is not in shouldFailover, so the walk stops on the first attempt.
+  globalThis.fetch = (async () => new Response('{"error":{"message":"bad request"}}', { status: 400 })) as typeof fetch
+  const early = await chatCompletions(poolReq())
+  t('a non-retryable provider error stops on the first attempt', early.status === 400 && early.headers.get('x-relaybee-attempts') === '1', 'attempts=' + early.headers.get('x-relaybee-attempts'))
+  t('and it still reports how big the pool was', early.headers.get('x-relaybee-pool-size') === '3', early.headers.get('x-relaybee-pool-size') ?? 'absent')
+
+  // 429 is retryable, so this one walks the whole pool and falls out the end.
+  globalThis.fetch = (async () => new Response('{"error":{"message":"slow down"}}', { status: 429 })) as typeof fetch
+  const exhausted = await chatCompletions(poolReq())
+  t('an all-429 pool is walked to the end', exhausted.status === 429 && exhausted.headers.get('x-relaybee-attempts') === '3', 'attempts=' + exhausted.headers.get('x-relaybee-attempts'))
+  t('and the exhausted exit reports the pool size too', exhausted.headers.get('x-relaybee-pool-size') === '3', exhausted.headers.get('x-relaybee-pool-size') ?? 'absent')
+  // Both sizes must be PRESENT, not merely equal. Comparing two absent headers
+  // is true, so the obvious form of this assertion passes against the very bug
+  // it is here to catch.
+  t('the pair is what tells a stopped walk from a small pool',
+    early.headers.get('x-relaybee-pool-size') === '3' && exhausted.headers.get('x-relaybee-pool-size') === '3'
+    && early.headers.get('x-relaybee-attempts') !== exhausted.headers.get('x-relaybee-attempts'))
+  globalThis.fetch = saved
+}
 
 // The pre-rename header name is sitting in other people's env files and app
 // configs, where nothing announces that this project changed its name. It has
@@ -606,6 +649,62 @@ const connectErrJson = await connectErr.json()
 t('connect: a forced error returns a clean 500', connectErr.status === 500)
 t('connect: the error path keeps CORS', connectErr.headers.get('access-control-allow-origin') === '*')
 t('connect: the error path carries a {message,type} envelope', typeof connectErrJson.error?.message === 'string' && typeof connectErrJson.error?.type === 'string')
+
+console.log('\npublic pool — repeated submissions are throttled on one warm instance')
+// The general limit meters a caller against Relaybee's quota. A public-pool job
+// spends a volunteer's API key instead, which is why it needs its own smaller
+// per-instance threshold. Drive the bucket to its edge first: the throttle is
+// charged before queueing, so a refusal returns at once instead of holding the
+// relay's 20s window open, and the test costs no wall-clock.
+{
+  const { check, PUBLIC_POOL_LIMIT, LIMITS } = await import('../lib/ratelimit.ts')
+  const capUser = 'pool_cap_user'
+  const capKey = await issueKey(capUser)
+  const publicReq = (key = capKey, ip?: string) => new Request('https://x/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${key}`, ...(ip ? { 'x-real-ip': ip } : {}) },
+    body: JSON.stringify({ model: 'claude-code/public', messages: [{ role: 'user', content: 'cap' }] }),
+  })
+
+  t('the public-pool threshold is below the general per-instance limit', PUBLIC_POOL_LIMIT < LIMITS.free,
+    `public=${PUBLIC_POOL_LIMIT} general=${LIMITS.free}`)
+
+  // Spend the key's per-instance threshold without going through the handler,
+  // so the assertion below is about the throttle and not about queue timing.
+  check(`public:${capUser}`, PUBLIC_POOL_LIMIT, PUBLIC_POOL_LIMIT)
+  const refused = await chatCompletions(publicReq())
+  t('a key over this instance\'s public-pool threshold is refused', refused.status === 429, `status=${refused.status}`)
+  const refusedBody = await refused.json()
+  t('and told to use their own node instead, which is the un-capped path',
+    /claude-code/.test(refusedBody.error?.message ?? '') && refusedBody.error?.type === 'rate_limit_error')
+  t('the refusal carries rate-limit headers a client can read',
+    refused.headers.get('x-ratelimit-limit') === String(PUBLIC_POOL_LIMIT))
+
+  const capIp = '203.0.113.24'
+  const ipUser = 'pool_cap_ip_user'
+  const ipKey = await issueKey(ipUser)
+  check(`public-ip:${capIp}`, PUBLIC_POOL_LIMIT, PUBLIC_POOL_LIMIT)
+  const refusedIp = await chatCompletions(publicReq(ipKey, capIp))
+  t('a source over this instance\'s public-pool threshold is refused even with a fresh key',
+    refusedIp.status === 429, `status=${refusedIp.status}`)
+
+  // The throttle is on the public pool alone: a caller's own node is their own
+  // spend, so exhausting the public threshold must not close the path they own.
+  // Driven through the real handler with a node of their own answering, because
+  // the claim is about the handler's routing and reading a bucket would not test
+  // it. The node earns its keep twice: with nobody answering, this call holds the
+  // relay's 20s window open, which is 20s on every run of the gate.
+  const capSupporter = await issueKey(capUser)
+  const ownReq = chatCompletions(new Request('https://x/api/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${capKey}` },
+    body: JSON.stringify({ model: 'claude-code', messages: [{ role: 'user', content: 'own-after-cap' }] }),
+  }))
+  const cycled = await supporterCycle(undefined, capSupporter, 'own')
+  const ownAfter = await ownReq
+  t('and the caller\'s own pool still answers after the public threshold is exhausted',
+    ownAfter.status === 200, `status=${ownAfter.status} node=${cycled.polled}`)
+}
 
 console.log('\nCORS — the capability endpoints answer named origins, not everyone')
 // /api/keys/issue is an unauthenticated simple POST, so a wildcard let any page
@@ -889,6 +988,14 @@ t('the worker removes the MCP and skill surface rather than listing it',
 // auto-approved a CronCreate from a stranger's prompt.
 t('a single job cannot wedge the node', /timeout 120 claude/.test(llms))
 t('each job has a spend ceiling', /--max-budget-usd/.test(llms))
+// Grepping for the flag name leaves the number free to change without anything
+// noticing, and PROJECT.md quotes these two figures as what a volunteer is
+// agreeing to. Pin the values, so moving one is a deliberate edit to the board
+// and the test together rather than a silent change to somebody's bill.
+t('and the per-job ceiling is the 0.50 the board quotes', /--max-budget-usd 0\.50\b/.test(llms))
+t('and the job-count default is the 100 the board quotes', /RELAYBEE_MAX_JOBS:-100\}/.test(llms))
+t('and the count is enforced by the loop, not merely stated',
+  /\$DONE.*-ge.*\$MAXJOBS/s.test(llms) && /break/.test(llms))
 // A per-job cap with no total is still an unbounded commitment, and every
 // Sonnet trial against the hardened file stopped to say so before running it.
 // The loop stops itself after MAXJOBS, so the spend a supporter agrees to is
