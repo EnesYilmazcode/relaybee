@@ -1672,6 +1672,35 @@ console.log('%spaths coverage said never ran', String.fromCharCode(10))
   const badJson = await chatCompletions(covReq('{"model": "claude-code", messages'))
   t('a malformed body is a clean 400', badJson.status === 400, `status=${badJson.status}`)
 
+  // Request validation belongs before the relay/provider split. A null message
+  // used to be handled on the relay path but throw inside a provider adapter,
+  // turning malformed client input into a generic 500.
+  const emptyMessages = await chatCompletions(covReq({
+    model: 'anthropic/claude-opus-5', messages: [],
+  }))
+  t('an empty messages array is a clean 400', emptyMessages.status === 400, `status=${emptyMessages.status}`)
+
+  const malformedConn = await seal({
+    provider: 'anthropic', apiKey: 'sk-ant-malformed', owner: 'coverage_probe', createdAt: Date.now(),
+  })
+  let malformedUpstreamCalls = 0
+  const malformedFetch = globalThis.fetch
+  globalThis.fetch = async () => {
+    malformedUpstreamCalls++
+    return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+  }
+  const nullMessage = await chatCompletions(covReq(
+    { model: 'anthropic/claude-opus-5', messages: [null] },
+    { 'x-relaybee-connection': malformedConn },
+  ))
+  globalThis.fetch = malformedFetch
+  const nullMessageBody = await nullMessage.json()
+  t('a non-object provider message is a clean 400',
+    nullMessage.status === 400 && /must be an object/i.test(nullMessageBody.error?.message ?? ''),
+    `status=${nullMessage.status}`)
+  t('a malformed message is rejected before any upstream call', malformedUpstreamCalls === 0,
+    `calls=${malformedUpstreamCalls}`)
+
   // 3. A pooled request is metered per connection. Eight blobs is eight upstream
   //    calls, and pricing that at one is what made batch key-testing cheap.
   const poolConns: string[] = []

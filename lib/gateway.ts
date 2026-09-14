@@ -406,6 +406,9 @@ async function chatCompletionsInner(req: Request): Promise<Response> {
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     return err(400, 'Field "messages" must be a non-empty array.', 'invalid_request_error', headers)
   }
+  if (!body.messages.every((message) => message !== null && typeof message === 'object' && !Array.isArray(message))) {
+    return err(400, 'Each item in "messages" must be an object.', 'invalid_request_error', headers)
+  }
 
   if (body.model === RELAY_PROVIDER || body.model.startsWith(`${RELAY_PROVIDER}/`)) {
     return relayCompletion(req, body, auth.u, headers)
