@@ -36,7 +36,9 @@ The [docs page](https://relaybee.vercel.app/docs.html) fills every example in wi
 will run the first call for you, so you can check it works before writing any code. Adding your own
 provider key is one more call, `POST /api/connect`, and the docs page has it ready to copy.
 
-From code it is three lines of setup. Any OpenAI client works:
+From code it is three lines of setup. Any OpenAI client works.
+
+JavaScript:
 
 ```js
 import OpenAI from 'openai'
@@ -51,6 +53,28 @@ const res = await relaybee.chat.completions.create({
   model: 'anthropic/claude-opus-5',
   messages: [{ role: 'user', content: 'hi' }],
 })
+```
+
+Python:
+
+```python
+import os
+
+from openai import OpenAI
+
+relaybee = OpenAI(
+    base_url="https://relaybee.vercel.app/api/v1",
+    api_key=os.environ["RELAYBEE_KEY"],
+    default_headers={
+        "X-Relaybee-Connection": os.environ["RELAYBEE_CONNECTIONS"],
+    },
+)
+
+res = relaybee.chat.completions.create(
+    model="anthropic/claude-opus-5",
+    messages=[{"role": "user", "content": "hi"}],
+)
+print(res.choices[0].message.content)
 ```
 
 Models are named `provider/model`, like `anthropic/claude-opus-5`, `openai/gpt-4o`, or

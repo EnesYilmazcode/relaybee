@@ -11,7 +11,7 @@ decision: whether to rotate `MASTER_SECRET` over the key leaked in `test_ascii_a
 key is valid until 2026-10-31 and rotation is the only lever, which invalidates every key in
 existence.
 **Live URL:** https://relaybee.vercel.app
-**Last updated:** 2026-09-01
+**Last updated:** 2026-09-13
 
 ---
 
@@ -108,6 +108,7 @@ existence.
 | 85 | Two more assertions that could not fail made real, bringing the round's total of vacuous checks to six | `test` (#100) |
 | 86 | `SECURITY.md` and `lib/queue.ts` stopped calling the job id the capability, which the ticket replaced | `docs` (#100) |
 | 87 | The endpoints that hand back a key or a job answer named origins instead of `*`, so a page a visitor loads can no longer read a minted key out of their browser | `fix(web)` (#101) |
+| 88 | README quickstart includes equivalent JavaScript and Python OpenAI client examples | `docs` (#111) |
 
 ### Resolved: Relaybee is a personal capacity router
 
