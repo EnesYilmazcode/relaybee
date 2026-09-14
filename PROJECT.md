@@ -367,6 +367,24 @@ project — revisit only if this stops being a demo.
 
 Why things are the way they are, so a future change doesn't quietly undo a deliberate choice.
 
+**2026-09-01 · The terminal client is a third script, not a package.**
+The Next table asked for an npm client that mints, seals and composes a config the way the setup
+page did. It shipped as `scripts/relaybee.mjs`, alongside `supporter.mjs` and `verify-provider.mjs`,
+rather than as a publishable package. A package directory brings a second manifest carrying the same
+name and version as the root one, a LICENSE this repo does not have, and an npm-pack line-ending
+trap on Windows that would publish a CRLF shebang and fail on every other platform, and it buys
+nothing until someone actually publishes. `scripts/` already holds two zero-dependency executable
+CLIs, so this is the shape the repo already uses. If it is ever published, that is a separate
+decision with its own costs.
+
+It talks to the deployed HTTP API rather than importing `lib/`, and that is not a shortcut: `lib/`
+is Edge-only and `MASTER_ENCRYPTION_KEY` never leaves the server, so sealing locally is not
+possible at all.
+
+The one thing worth knowing before using it is that minting twice is not refreshing a key. Every
+mint gets a fresh random user id (`api/keys/issue.ts`), and a sealed blob is bound to the id that
+sealed it, so a second mint creates a new identity and orphans every stored connection with no way
+to recover them. It refuses without `--force` and says how many would be lost.
 **2026-09-01 · No retry budget on the pool walk. The meter already prices it.**
 The Next table carried "one bad pool of 8 blobs costs 8 upstream calls" from 2026-07-28 (`0920e4e`).
 Two things had already happened to it. Provider statuses that cannot differ between credentials end
