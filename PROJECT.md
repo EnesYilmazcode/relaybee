@@ -346,7 +346,6 @@ time it ran, on a branch that was missing #89.
 |---|---|---|
 | P1 | End-to-end test with a **real** provider key | The largest unverified claim in the repo. The live chain reaches Anthropic and returns a real `request_id`, but no successful completion has ever come back, and `test/e2e.mts` mocks the upstream, so the Anthropic response parsing is only ever checked against a fake written from the docs. One minute and about two cents: `node scripts/verify-provider.mjs` |
 | P1 | npm client package | Mint/seal/compose-config from the terminal, mirroring the setup page. The self-relay routing itself shipped in #100 and is what `claude-code` already means; what is missing is the terminal-side wrapper, so design for that rather than for the routing |
-| P2 | Retry budget per request | One bad pool of 8 blobs currently costs 8 upstream calls |
 | P2 | Record the demo clip for the post | Failover across your own providers — show two keys, kill one |
 | P3 | GitHub OAuth key recovery | **Demoted 2026-08-01.** Its stated justification does not survive the code. The reason given was that a lost key orphans every AAD-bound blob, but user ids are generated randomly at mint time (`api/keys/issue.ts`, `${clean}_${randomUUID}`) and blobs are sealed to that id, so an OAuth-derived id is a different id and opens none of them. It could only help someone who arrived through OAuth on their first ever mint, and there are none. The mechanism stays pre-agreed if identity is ever forced |
 
@@ -366,6 +365,31 @@ project — revisit only if this stops being a demo.
 ## Decision log
 
 Why things are the way they are, so a future change doesn't quietly undo a deliberate choice.
+
+**2026-09-01 · No retry budget on the pool walk. The meter already prices it.**
+The Next table carried "one bad pool of 8 blobs costs 8 upstream calls" from 2026-07-28 (`0920e4e`).
+Two things had already happened to it. Provider statuses that cannot differ between credentials end
+the walk on the first attempt, because `shouldFailover` retries only 401, 403, 429 and 5xx, so a
+malformed request costs one upstream call and not eight. And the per-connection meter that closed the
+key-oracle advisory (`3649d26`, 2026-08-20) charges a pooled request `conns.length` units against
+`IP_PROXY_LIMIT`, which makes upstream calls per minute per source flat at 60 whatever the pool size:
+
+    pool=1  60 requests/min  60 upstream calls/min
+    pool=8   7 requests/min  56 upstream calls/min
+
+So an 8-blob pool is now the cheapest shape a caller can send, and there is nothing left to bound.
+A budget would also not bind the party it is aimed at, since the caller picks the pool size and an
+abuser would send single blobs. And it would break what `public/docs.html` promises, that a pool
+behaves like one key with the combined quota: the walk starts at a random offset, so a budget of 3 on
+a pool of 8 holding 2 live keys fails somewhere between 25% and 50% of the requests that succeed
+today, differently each time. Nondeterministic failover is a worse thing to own than calls the meter
+already prices one for one.
+
+What did come out of looking: both failure exits omitted `x-relaybee-pool-size`, so a walk that
+stopped on its first attempt was indistinguishable from a pool that only ever had one connection.
+Those need opposite fixes, and `lib/seal.ts` drops an unopenable or wrong-provider blob silently, so
+the size is the only thing that tells them apart from outside. Both pool headers now come from one
+builder and every exit carries both.
 
 **2026-09-01 · The public pool stays, opt-in on both ends and empty by default.**
 Settled on #76. Self-relay is the default and is what `claude-code` means; answering strangers

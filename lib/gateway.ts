@@ -450,7 +450,17 @@ async function chatCompletionsInner(req: Request): Promise<Response> {
   // "label:unreachable". Callers debugging a half-dead pool need to see which
   // connections failed, not just which one finally answered.
   const health: string[] = []
-  const poolHealth = () => ({ 'x-relaybee-pool-health': health.join(', ') })
+  // Both pool headers come from here so every exit carries both. They used to
+  // diverge: only the success path reported the size, so a request that failed
+  // on its first attempt looked identical to one whose pool was that single
+  // connection. Those are opposite problems. One caller has untried keys left,
+  // the other pasted blobs the routed adapter never matched, and lib/seal.ts
+  // drops an unopenable blob silently, so the size is the only thing that tells
+  // them apart from outside.
+  const poolMeta = () => ({
+    'x-relaybee-pool-size': String(conns.length),
+    'x-relaybee-pool-health': health.join(', '),
+  })
 
   for (let i = 0; i < conns.length; i++) {
     const conn = conns[(start + i) % conns.length]
@@ -478,7 +488,7 @@ async function chatCompletionsInner(req: Request): Promise<Response> {
       // caller sees the provider's own explanation.
       return new Response(lastText, {
         status: upstream.status,
-        headers: { 'content-type': 'application/json', ...CORS, ...headers, 'x-relaybee-attempts': String(i + 1), ...poolHealth() },
+        headers: { 'content-type': 'application/json', ...CORS, ...headers, 'x-relaybee-attempts': String(i + 1), ...poolMeta() },
       })
     }
 
@@ -487,8 +497,7 @@ async function chatCompletionsInner(req: Request): Promise<Response> {
       'x-relaybee-provider': adapter.id,
       'x-relaybee-connection-label': conn.label ?? 'unnamed',
       'x-relaybee-attempt': String(i + 1),
-      'x-relaybee-pool-size': String(conns.length),
-      ...poolHealth(),
+      ...poolMeta(),
     }
 
     if (body.stream && upstream.body) {
@@ -514,6 +523,6 @@ async function chatCompletionsInner(req: Request): Promise<Response> {
 
   return new Response(lastText, {
     status: lastStatus,
-    headers: { 'content-type': 'application/json', ...CORS, ...headers, 'x-relaybee-attempts': String(conns.length), ...poolHealth() },
+    headers: { 'content-type': 'application/json', ...CORS, ...headers, 'x-relaybee-attempts': String(conns.length), ...poolMeta() },
   })
 }

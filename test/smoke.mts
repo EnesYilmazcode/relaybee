@@ -353,6 +353,49 @@ t('pool health lists the failed connection', ph.includes(':429'), ph)
 t('pool health lists the winner last', ph.endsWith(':ok'), ph)
 t('attempt count matches the walk', healthRes.headers.get('x-relaybee-attempt') === '2')
 t('pool health is exposed to browsers', (healthRes.headers.get('access-control-expose-headers') ?? '').includes('x-relaybee-pool-health'))
+t('the success path reports the pool size', healthRes.headers.get('x-relaybee-pool-size') === '2', healthRes.headers.get('x-relaybee-pool-size') ?? 'absent')
+
+// Both failure exits used to omit the pool size, so a request that stopped on
+// its first attempt was indistinguishable from one whose pool WAS that single
+// connection. Opposite problems: untried keys left over, versus blobs the
+// routed adapter never matched, which lib/seal.ts drops without saying so.
+// Nothing here asserts WHICH connection was tried, because the walk starts at
+// a random offset (lib/gateway.ts) and every connection in these pools behaves
+// identically, which is what makes the assertions deterministic.
+{
+  const sizeKey = await issueKey('pool_size_user')
+  const three = await Promise.all(['aa', 'bb', 'cc'].map((k, i) => seal(
+    { provider: 'anthropic', apiKey: 'sk-ant-' + k, owner: 'pool_size_user', createdAt: Date.now(), label: 'c' + i })))
+  const poolReq = () => new Request('https://x/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer ' + sizeKey,
+      'x-relaybee-connection': three.join(','),
+    },
+    body: JSON.stringify({ model: 'anthropic/claude-opus-5', messages: [{ role: 'user', content: 'size' }] }),
+  })
+  const saved = globalThis.fetch
+
+  // 400 is not in shouldFailover, so the walk stops on the first attempt.
+  globalThis.fetch = (async () => new Response('{"error":{"message":"bad request"}}', { status: 400 })) as typeof fetch
+  const early = await chatCompletions(poolReq())
+  t('a non-retryable provider error stops on the first attempt', early.status === 400 && early.headers.get('x-relaybee-attempts') === '1', 'attempts=' + early.headers.get('x-relaybee-attempts'))
+  t('and it still reports how big the pool was', early.headers.get('x-relaybee-pool-size') === '3', early.headers.get('x-relaybee-pool-size') ?? 'absent')
+
+  // 429 is retryable, so this one walks the whole pool and falls out the end.
+  globalThis.fetch = (async () => new Response('{"error":{"message":"slow down"}}', { status: 429 })) as typeof fetch
+  const exhausted = await chatCompletions(poolReq())
+  t('an all-429 pool is walked to the end', exhausted.status === 429 && exhausted.headers.get('x-relaybee-attempts') === '3', 'attempts=' + exhausted.headers.get('x-relaybee-attempts'))
+  t('and the exhausted exit reports the pool size too', exhausted.headers.get('x-relaybee-pool-size') === '3', exhausted.headers.get('x-relaybee-pool-size') ?? 'absent')
+  // Both sizes must be PRESENT, not merely equal. Comparing two absent headers
+  // is true, so the obvious form of this assertion passes against the very bug
+  // it is here to catch.
+  t('the pair is what tells a stopped walk from a small pool',
+    early.headers.get('x-relaybee-pool-size') === '3' && exhausted.headers.get('x-relaybee-pool-size') === '3'
+    && early.headers.get('x-relaybee-attempts') !== exhausted.headers.get('x-relaybee-attempts'))
+  globalThis.fetch = saved
+}
 
 // The pre-rename header name is sitting in other people's env files and app
 // configs, where nothing announces that this project changed its name. It has
