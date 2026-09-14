@@ -391,6 +391,20 @@ stopped on its first attempt was indistinguishable from a pool that only ever ha
 Those need opposite fixes, and `lib/seal.ts` drops an unopenable or wrong-provider blob silently, so
 the size is the only thing that tells them apart from outside. Both pool headers now come from one
 builder and every exit carries both.
+ **2026-09-01 · A reply is not proof the agent spoke.**
+Both supporter ports decided the agent had answered by looking at `.result`. A failed run uses the
+SAME envelope as a good one: a revoked key, an empty balance or a 429 arrives as subtype "success"
+with `is_error: true` and the provider error text sitting in `.result` where the answer goes, while
+the error subtypes carry `.errors` and no `.result` at all. So the startup probe passed, the node
+started, took jobs off the queue, and handed every caller the CLI error message while
+`/api/work/status` reported it connected. The probe comment had named exactly this failure and then
+tested the wrong thing, which is why it survived: it reads as covered.
+
+Five places now read the error flag rather than the length of a string: the startup probe, the answer
+path, the Node port’s `parseAgent`, the protocol section for anyone writing their own worker, and the
+pasted brief on the homepage. A node whose key dies mid-run delivers the job it already took, since
+taking it removed it from the queue, then stops rather than working through the queue answering
+everyone with the same error.
 
 **2026-09-01 · The public pool stays, opt-in on both ends and empty by default.**
 Settled on #76. Self-relay is the default and is what `claude-code` means; answering strangers

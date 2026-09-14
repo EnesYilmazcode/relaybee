@@ -109,7 +109,12 @@ Answer each job from a fresh empty directory with tools switched OFF, like this:
   SAFE="--bare --safe-mode --strict-mcp-config --no-session-persistence"
   NOTOOLS="Bash,BashOutput,KillShell,Read,Write,Edit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task,Agent,TodoWrite,ToolSearch,Skill,Workflow,Artifact,AskUserQuestion,SendUserFile,ReportFindings,ScheduleWakeup,CronCreate,CronDelete,CronList,DesignSync,EnterWorktree,ExitWorktree,EnterPlanMode,ExitPlanMode,Monitor,PushNotification,RemoteTrigger,SendMessage,EndConversation,TaskCreate,TaskGet,TaskList,TaskUpdate,TaskStop,TaskOutput"
   timeout 120 claude -p $SAFE --output-format json --max-budget-usd 0.50 --disallowedTools "$NOTOOLS"
---output-format json is what makes step 3 able to report a cost: .result is the answer,
+--output-format json is what makes step 3 able to report a cost, but check .is_error
+before you trust .result. A failed run uses the same envelope, so a revoked key or an
+empty balance arrives as subtype "success" with is_error true and the error text sitting
+in .result. Deliver that and you answer every caller with the CLI's error message while
+the relay reports you connected. Stop the loop on one, send the fallback text, and say
+why. Otherwise: .result is the answer,
 .usage carries the token counts and .total_cost_usd the dollar figure. Relaybee never sees
 the model call, so this node is the only place those numbers exist. A build that does not
 emit the envelope still answers, so use its plain output as the answer and deliver that
