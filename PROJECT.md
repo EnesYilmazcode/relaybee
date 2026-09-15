@@ -4,14 +4,14 @@ Living status doc. Updated in the same commit as the change it describes, so the
 stale relative to the code. Newest entries at the top of each log.
 
 **Status:** deployed, and the relay is verified end to end on production rather than only in local
-tests. The private-pools round landed as #100 and the CORS allowlist as #101, so `main` carries
-both and there is no branch waiting to go in. The relay's direction is decided (see the #76
+tests. `main` carries the private-pools and CORS work from #100 and #101, the terminal client from
+#109, and the latest request-boundary fix from #114. The relay's direction is decided (see the #76
 section below: the public pool stays, opt-in and empty by default). **One thing still wants a
 decision: whether to rotate `MASTER_SECRET` over the key leaked in `test_ascii_art.py`.** That
 key is valid until 2026-10-31 and rotation is the only lever, which invalidates every key in
 existence.
 **Live URL:** https://relaybee.vercel.app
-**Last updated:** 2026-09-13
+**Last updated:** 2026-09-15
 
 ---
 
@@ -109,6 +109,10 @@ existence.
 | 86 | `SECURITY.md` and `lib/queue.ts` stopped calling the job id the capability, which the ticket replaced | `docs` (#100) |
 | 87 | The endpoints that hand back a key or a job answer named origins instead of `*`, so a page a visitor loads can no longer read a minted key out of their browser | `fix(web)` (#101) |
 | 88 | The public pool has a best-effort per-instance throttle per key and source, reducing repeated claims on volunteer capacity; the two spend figures the board quotes are pinned rather than grepped for | `fix(relay)` (#103) |
+| 89 | Pool size is reported on success and failure, so callers can distinguish one connection from a stopped multi-connection walk | `fix(api)` (#105) |
+| 90 | Supporter nodes reject failed agent runs instead of returning CLI error text as an answer | `fix(supporter)` (#107) |
+| 91 | Zero-dependency terminal client to mint a key, seal connections and compose configs without exposing provider keys in argv | `feat(cli)` (#109) |
+| 92 | Provider and relay requests reject malformed message elements at the shared request boundary | `fix(api)` (#114) |
 
 ### Resolved: Relaybee is a personal capacity router
 
@@ -346,7 +350,6 @@ time it ran, on a branch that was missing #89.
 | Priority | Item | Why |
 |---|---|---|
 | P1 | End-to-end test with a **real** provider key | The largest unverified claim in the repo. The live chain reaches Anthropic and returns a real `request_id`, but no successful completion has ever come back, and `test/e2e.mts` mocks the upstream, so the Anthropic response parsing is only ever checked against a fake written from the docs. One minute and about two cents: `node scripts/verify-provider.mjs` |
-| P1 | npm client package | Mint/seal/compose-config from the terminal, mirroring the setup page. The self-relay routing itself shipped in #100 and is what `claude-code` already means; what is missing is the terminal-side wrapper, so design for that rather than for the routing |
 | P2 | Record the demo clip for the post | Failover across your own providers — show two keys, kill one |
 | P3 | GitHub OAuth key recovery | **Demoted 2026-08-01.** Its stated justification does not survive the code. The reason given was that a lost key orphans every AAD-bound blob, but user ids are generated randomly at mint time (`api/keys/issue.ts`, `${clean}_${randomUUID}`) and blobs are sealed to that id, so an OAuth-derived id is a different id and opens none of them. It could only help someone who arrived through OAuth on their first ever mint, and there are none. The mechanism stays pre-agreed if identity is ever forced |
 
