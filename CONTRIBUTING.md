@@ -10,17 +10,21 @@ npm install
 npm run check
 ```
 
-`npm run check` is typecheck (`tsc --noEmit`) plus the smoke suite (`test/smoke.mts`). It must
-pass before every commit. Add assertions when you add behavior.
+`npm run check` is the complete local gate. It runs the typecheck, smoke suite, Upstash queue
+suite, end-to-end HTTP suite and adversary suite, in that order. It must pass before every commit.
+Add assertions when you add behavior.
 
-The end-to-end HTTP test boots the real handlers and drives a full round trip:
+Each suite can still be run by itself while iterating:
 
 ```bash
+npm test
+npm run test:upstash
 npm run test:e2e
+npm run test:adversary
 ```
 
-Both `npm run check` and `npm run test:e2e` also run in CI on every push and PR
-(`.github/workflows/ci.yml`). A PR that is not green does not merge.
+CI runs `npm run check` on every push to `main` and every PR (`.github/workflows/ci.yml`). A PR
+that is not green does not merge.
 
 ## Architecture invariants
 
@@ -44,7 +48,7 @@ in full in `CLAUDE.md`; the short version:
 1. Branch off `main`. Use a short descriptive name, for example `feat/retry-budget` or
    `fix/pool-cap`.
 2. Make the change scoped to one issue. No unrelated refactors in the same PR.
-3. Run `npm run check` (and `npm run test:e2e` if you touched the request path or the relay).
+3. Run `npm run check`.
 4. Commit with a clear message. Keep the subject line short and in the imperative mood.
 5. Open a PR against `main` and fill in the pull request template.
 6. CI must be green. `main` deploys to production automatically, so merging ships.
