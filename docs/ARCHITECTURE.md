@@ -81,6 +81,17 @@ ordinary Relaybee key, and what that key hands it is the jobs filed under that
 same key, so its own queue is the whole of its access. The answer flows back to
 the waiting caller, shaped like an ordinary OpenAI completion.
 
+Workers can deliver in either of two compatible forms. Older workers post one finished answer to
+`/api/work/complete`. Streaming workers post text deltas and a final usage frame to
+`/api/work/stream`; each delta is appended to the result list, and the caller's existing blocking
+read receives it immediately. Streaming callers get one OpenAI content chunk per worker frame,
+while buffered callers aggregate the same events until the final frame. The ticket is checked on
+every write. A provider failure after partial output sends a terminal error frame, so incomplete
+text is never labelled as a successful answer. The bundled API-funded worker sends the first
+provider delta immediately and batches
+later small deltas, avoiding coding-agent context overhead without turning every token into a Redis
+request.
+
 `claude-code/public` is the way out of that. It parks the job on one shared pool
 instead, which a node joins by sending `{"pool":"public"}` as the body of its
 poll. Both halves are named on purpose. There used to be a single global list,
@@ -104,8 +115,15 @@ caller against their own node, a `/public` caller against the opt-in count. One
 count for both could only say yes on the strength of some unrelated node, and
 hold a public caller for the whole streaming window on it.
 
-The queue is the only stateful piece in the system. It uses Upstash Redis when
-those environment variables are set, and a per-instance in-memory map otherwise.
+The queue is the only stateful piece in the system. It uses Upstash Redis in
+serverless production, and a per-instance in-memory map only in local development.
+Vercel production fails closed when either Upstash variable is absent; other
+serverless hosts can enforce the same guard with
+`RELAYBEE_REQUIRE_DISTRIBUTED_QUEUE=1`. This prevents a deployment from appearing
+healthy while callers and workers are isolated in different instances.
+Queue publication batches its `LPUSH`, cap and expiry into one REST pipeline;
+answer publication likewise batches its value and expiry. Redis still meters the
+individual commands, but each hot path pays for only one network round trip.
 Jobs carry only the model and the flattened messages, never the requester's id
 or IP: the identity is in the queue's name, which the node never sees.
 

@@ -29,7 +29,10 @@ console.log('\nupstash — the real REST path, not the memory fallback')
 t('the queue selected the Upstash store', queue.QUEUE_DISTRIBUTED === true)
 
 console.log('\nupstash — job round trip')
+fake.reset()
 const submitted = await queue.submitJob('claude-code', [{ role: 'user', content: 'hello upstash' }], OWNER)
+t('publishing a job batches three commands into one REST request',
+  fake.total() === 3 && fake.requests() === 1, `${fake.total()} commands in ${fake.requests()} request(s)`)
 const popped = await queue.nextJob(2000, OWNER)
 t('a submitted job comes back off the REST queue', popped?.id === submitted.id, popped?.id ?? 'none')
 t('the job carries its messages intact', popped?.messages[0]?.content === 'hello upstash')
@@ -74,6 +77,22 @@ const costed = await queue.awaitResult(costedId, 2000)
 t('a reported cost survives the round trip', costed?.usage?.inputTokens === 12 && costed?.usage?.outputTokens === 34, JSON.stringify(costed?.usage))
 t('and the answer still comes back with it', costed?.text === 'costed answer')
 
+const streamedId = 'result-streamed'
+await queue.appendResultDelta(streamedId, 'cheap ')
+await queue.appendResultDelta(streamedId, 'and live')
+await queue.finishResultStream(streamedId, { inputTokens: 3, outputTokens: 2, costUsd: 0.0001 })
+const streamed = await queue.awaitResult(streamedId, 2000)
+t('a buffered caller can consume incremental worker frames', streamed?.text === 'cheap and live', streamed?.text)
+t('stream completion carries final accounting', streamed?.usage?.costUsd === 0.0001, JSON.stringify(streamed?.usage))
+
+const failedStreamId = 'result-stream-failed'
+await queue.appendResultDelta(failedStreamId, 'partial')
+await queue.failResultStream(failedStreamId, 'provider stream failed')
+let streamFailure = ''
+try { await queue.awaitResult(failedStreamId, 2_000) }
+catch (error) { streamFailure = error instanceof Error ? error.message : String(error) }
+t('a terminal stream error is not returned as a successful partial answer', streamFailure === 'provider stream failed')
+
 // An answer written before this envelope existed is a bare string in Redis, and
 // it has to stay readable for RESULT_TTL_S across the deploy that introduces it.
 const legacyId = 'result-pre-envelope'
@@ -94,6 +113,7 @@ t('a 3s wait costs one command, not six', fake.total() === 1, `${fake.total()} c
 fake.reset()
 await queue.completeJob('cost-check', 'x')
 t('publishing an answer costs two commands', fake.total() === 2, `${fake.total()}`)
+t('and batches them into one REST request', fake.requests() === 1, `${fake.requests()} request(s)`)
 
 console.log('\nupstash — presence')
 await queue.markLive('node-a')

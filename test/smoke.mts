@@ -417,6 +417,7 @@ t('the old header name is still allowed through preflight', (legacyHeaderRes.hea
 console.log('\nsupporter relay — claude-code jobs round-trip through the queue')
 const workNext = (await import('../api/work/next.ts')).default
 const workComplete = (await import('../api/work/complete.ts')).default
+const workStream = (await import('../api/work/stream.ts')).default
 const userKey = await issueKey('relay_user')
 // The SAME user id, a different key string: one person's app calling, and that
 // same person's machine answering. That pairing is the whole access control now.
@@ -542,7 +543,21 @@ t('a node that never polled reads offline', before.connected === false)
 
 // A poll marks the node live before it even returns work. Give it a job to pop
 // so the long-poll returns immediately instead of holding the full window.
-const { submitJob } = await import('../lib/queue.ts')
+const { submitJob, queueBackendFor } = await import('../lib/queue.ts')
+console.log('\nqueue deployment mode — serverless never silently uses instance memory')
+t('local development can use the memory queue', queueBackendFor({}) === 'memory')
+t('both Upstash values select the distributed queue', queueBackendFor({
+  UPSTASH_REDIS_REST_URL: 'https://queue.example', UPSTASH_REDIS_REST_TOKEN: 'secret',
+}) === 'upstash')
+t('partial Upstash configuration fails closed', queueBackendFor({
+  UPSTASH_REDIS_REST_URL: 'https://queue.example',
+}) === 'unconfigured')
+t('Vercel production without Upstash fails closed', queueBackendFor({
+  VERCEL: '1', VERCEL_ENV: 'production',
+}) === 'unconfigured')
+t('other serverless hosts can require shared state', queueBackendFor({
+  RELAYBEE_REQUIRE_DISTRIBUTED_QUEUE: '1',
+}) === 'unconfigured')
 // Queued under the same user the polling key names, because a node only ever
 // sees its own queue now.
 await submitJob('claude-code', [{ role: 'user', content: 'warm' }], PRESENCE_USER)
@@ -599,6 +614,14 @@ const completeHdrRes = await workComplete(new Request('https://x/api/work/comple
 }))
 t('complete rejection still carries rate-limit headers', completeHdrRes.status === 400 && hasRl(completeHdrRes))
 t('complete exposes rate-limit headers to browsers', exposesRl(completeHdrRes))
+
+const streamHdrRes = await workStream(new Request('https://x/api/work/stream', {
+  method: 'POST',
+  headers: { authorization: `Bearer ${rlKey}`, 'content-type': 'application/json' },
+  body: JSON.stringify({ id: 'not-a-uuid', delta: 'x' }),
+}))
+t('stream rejection still carries rate-limit headers', streamHdrRes.status === 400 && hasRl(streamHdrRes))
+t('stream exposes rate-limit headers to browsers', exposesRl(streamHdrRes))
 
 // /api/work/next: queue a job first so the long-poll returns 200 immediately
 // (an empty poll would hold the full window), then assert the headers ride along.
@@ -752,6 +775,7 @@ const relayEndpoints: [string, (r: Request) => Promise<Response>, string][] = [
   ['work/next', workNext, 'https://x/api/work/next'],
   ['work/status', workStatus, 'https://x/api/work/status'],
   ['work/complete', workComplete, 'https://x/api/work/complete'],
+  ['work/stream', workStream, 'https://x/api/work/stream'],
 ]
 for (const [name, relayHandler, relayUrl] of relayEndpoints) {
   const hostile = await pre(relayHandler, relayUrl, 'https://evil.example')
@@ -1340,6 +1364,42 @@ console.log('%ssupporter script - the flags that bound spend actually parse', St
   t('and ask still resolves a good envelope through the child-process boundary',
     goodAsk.code === 0 && goodAsk.out === 'OK:Paris.',
     goodAsk.out || `exit=${goodAsk.code}`)
+
+  // @ts-expect-error supporter.mjs is deliberately a zero-dependency JS executable.
+  const { askAnthropic } = await import('../scripts/supporter.mjs')
+  const providerFrames = [
+    { type: 'message_start', message: { usage: { input_tokens: 10 } } },
+    { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Par' } },
+    { type: 'content_block_delta', delta: { type: 'text_delta', text: 'is.' } },
+    { type: 'message_delta', usage: { output_tokens: 2 } },
+    { type: 'message_stop' },
+  ].map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('')
+  const deltas: string[] = []
+  let directBody: any
+  const direct = await askAnthropic(
+    [{ role: 'system', content: 'Be brief' }, { role: 'user', content: 'Capital?' }],
+    async (delta: string) => { deltas.push(delta) },
+    async (_url: string, init: RequestInit) => {
+      directBody = JSON.parse(String(init.body))
+      return new Response(providerFrames, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    },
+  )
+  t('the donated-credit path calls the provider in streaming mode', directBody.stream === true)
+  t('provider deltas are forwarded before the result is assembled', deltas.join('') === 'Paris.' && deltas.length === 2)
+  t('the direct path reports tokens and configured-price cost',
+    direct.usage.input_tokens === 10 && direct.usage.output_tokens === 2 && direct.usage.cost_usd === 0.00002,
+    JSON.stringify(direct.usage))
+  t('system text stays system text instead of becoming a user turn', directBody.system === 'Be brief')
+  let providerFailure = ''
+  try {
+    await askAnthropic([{ role: 'user', content: 'fail?' }], async () => {}, async () => new Response(
+      'event: error\ndata: {"type":"error","error":{"message":"overloaded"}}\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ))
+  } catch (error) { providerFailure = error instanceof Error ? error.message : String(error) }
+  t('a provider error event fails the answer instead of accepting partial output', providerFailure === 'overloaded')
+  t('the public worker has both dollar and job-count donation ceilings',
+    /donatedUsd >= DONATED_BUDGET_USD/.test(supporterSource) && /served < MAX_JOBS/.test(supporterSource))
 
   const deliveryCatch = supporterSource.match(
     /catch \(e\) \{\s*log\('deliver failed:'[\s\S]*?\n    \}/)?.[0] ?? ''

@@ -20,6 +20,8 @@ export type FakeUpstash = {
   /** Command name (upper case) to call count. */
   counts: Map<string, number>
   total(): number
+  /** Number of HTTP requests made to the REST API (pipelines count once). */
+  requests(): number
   reset(): void
   /** Issue a command straight to the store, bypassing lib/queue. */
   raw(parts: Array<string | number>): Promise<unknown>
@@ -34,6 +36,7 @@ export async function startFakeUpstash(): Promise<FakeUpstash> {
   const expiries = new Map<string, number>()
   const counts = new Map<string, number>()
   let failures = 0
+  let requestCount = 0
 
   const expired = (key: string) => {
     const at = expiries.get(key)
@@ -144,6 +147,7 @@ export async function startFakeUpstash(): Promise<FakeUpstash> {
   }
 
   const server: Server = createServer(async (req, res) => {
+    requestCount++
     const chunks: Buffer[] = []
     for await (const c of req) chunks.push(c as Buffer)
     if (failures > 0) {
@@ -153,10 +157,17 @@ export async function startFakeUpstash(): Promise<FakeUpstash> {
       return
     }
     try {
-      const parts = JSON.parse(Buffer.concat(chunks).toString()) as Array<string | number>
-      const result = await run(parts)
+      const parsed = JSON.parse(Buffer.concat(chunks).toString()) as Array<string | number> | Array<Array<string | number>>
       res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ result }))
+      if (req.url === '/pipeline') {
+        const commands = parsed as Array<Array<string | number>>
+        const results = []
+        for (const parts of commands) results.push({ result: await run(parts) })
+        res.end(JSON.stringify(results))
+      } else {
+        const result = await run(parsed as Array<string | number>)
+        res.end(JSON.stringify({ result }))
+      }
     } catch (e) {
       res.statusCode = 400
       res.end(JSON.stringify({ error: String(e) }))
@@ -170,7 +181,8 @@ export async function startFakeUpstash(): Promise<FakeUpstash> {
     token: 'fake-token',
     counts,
     total: () => [...counts.values()].reduce((a, b) => a + b, 0),
-    reset: () => counts.clear(),
+    requests: () => requestCount,
+    reset: () => { counts.clear(); requestCount = 0 },
     raw: run,
     failNext: (n: number) => { failures = n },
     close: () => new Promise<void>((r) => server.close(() => r())),

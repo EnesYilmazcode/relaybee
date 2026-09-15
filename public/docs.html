@@ -281,7 +281,7 @@ curl.exe __ORIGIN__/api/v1/chat/completions `
       <tr><td><code>GET /api/health</code></td><td>Liveness, queue backend, deployed commit.</td></tr>
     </tbody>
   </table>
-  <p><code>POST /api/work/next</code> and <code>POST /api/work/complete</code> are the supporter
+  <p><code>POST /api/work/next</code>, <code>POST /api/work/stream</code>, and <code>POST /api/work/complete</code> are the supporter
   side. You do not call those to use Relaybee; a supporter node does. The whole loop is at
   <a href="/llms.txt">/llms.txt</a>.</p>
 

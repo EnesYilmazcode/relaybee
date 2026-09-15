@@ -3,10 +3,11 @@ import { bytesToB64u, enc } from './b64'
 // Work relay queue: users' chat requests go in, supporters' answers come out.
 //
 // Storage is Upstash Redis (REST) when UPSTASH_REDIS_REST_URL/TOKEN are set,
-// otherwise a per-instance in-memory fallback. The fallback lives on one warm
-// edge instance, so a user and a supporter only meet if they land on the same
-// instance. Good enough for a single-region demo and for tests; set Upstash to
-// make it real.
+// otherwise a per-instance in-memory fallback in local development. The
+// fallback lives on one warm edge instance, so a user and a supporter only meet
+// if they land on the same instance. A serverless production deployment fails
+// closed without Upstash instead of appearing healthy while losing jobs between
+// instances.
 
 export type Job = {
   id: string
@@ -29,6 +30,14 @@ export type Usage = {
 }
 
 export type Result = { text: string; usage?: Usage }
+export const MAX_RESULT_BYTES = 64 * 1024
+export type ResultEvent =
+  | { type: 'delta'; text: string }
+  | { type: 'done'; usage?: Usage }
+  | { type: 'error'; message: string }
+  | { type: 'complete'; result: Result }
+
+export class ResultStreamError extends Error {}
 
 const RESULT_TTL_S = 120
 const NODES_KEY = 'relaybee:nodes'
@@ -86,9 +95,9 @@ interface Store {
   remove(queue: string, job: Job): Promise<void>
   /** Block on every listed queue at once until a job arrives or maxWaitMs elapses. */
   waitPop(queues: string[], maxWaitMs: number): Promise<Job | null>
-  setResult(id: string, result: Result): Promise<void>
-  /** Block until this job's answer arrives or maxWaitMs elapses. */
-  waitResult(id: string, maxWaitMs: number): Promise<Result | null>
+  pushResultEvent(id: string, event: ResultEvent): Promise<void>
+  /** Block until this job's next answer event arrives or maxWaitMs elapses. */
+  waitResultEvent(id: string, maxWaitMs: number): Promise<ResultEvent | null>
   markPresence(userId: string, watchesPublic: boolean): Promise<void>
   isPresent(userId: string): Promise<boolean>
   countPresent(): Promise<number>
@@ -127,24 +136,38 @@ async function brpopUntil<T>(cmd: Cmd, keys: string[], maxWaitMs: number, take: 
 }
 
 function upstashStore(url: string, token: string): Store {
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
   const cmd = async (parts: Array<string | number>) => {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      headers,
       body: JSON.stringify(parts),
     })
     if (!res.ok) throw new Error(`queue backend error ${res.status}`)
     return ((await res.json()) as { result: unknown }).result
   }
+  const pipeline = async (commands: Array<Array<string | number>>): Promise<void> => {
+    const res = await fetch(`${url.replace(/\/$/, '')}/pipeline`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(commands),
+    })
+    if (!res.ok) throw new Error(`queue backend error ${res.status}`)
+    const replies = (await res.json()) as Array<{ error?: unknown }> | unknown
+    if (!Array.isArray(replies) || replies.length !== commands.length || replies.some((reply) => reply?.error)) {
+      throw new Error('queue backend returned an invalid pipeline response')
+    }
+  }
   return {
     push: async (queue, job) => {
-      await cmd(['LPUSH', queue, JSON.stringify(job)])
-      // Keep only the newest MAX_QUEUE (LPUSH prepends, BRPOP drains the tail).
-      await cmd(['LTRIM', queue, 0, MAX_QUEUE - 1])
-      // Without this a queue for a user who never runs a node lives forever.
-      // Jobs already expire by age on the way out; this stops the key itself
-      // accumulating, one command on a path that already costs two.
-      await cmd(['EXPIRE', queue, Math.ceil(JOB_MAX_AGE_MS / 1000) * 2])
+      // These remain three metered Redis commands, but one REST round trip. They
+      // are ordered inside the pipeline: append, cap, then attach the expiry.
+      await pipeline([
+        ['LPUSH', queue, JSON.stringify(job)],
+        ['LTRIM', queue, 0, MAX_QUEUE - 1],
+        // Without this a queue for a user who never runs a node lives forever.
+        ['EXPIRE', queue, Math.ceil(JOB_MAX_AGE_MS / 1000) * 2],
+      ])
     },
     // The value is byte-identical to what push serialised, since it is the same
     // object. If a supporter popped it a moment ago this removes nothing, which
@@ -166,15 +189,18 @@ function upstashStore(url: string, token: string): Store {
       }),
     // The answer is a one-element list rather than a plain string so the waiting
     // caller can BRPOP it instead of polling GET twice a second.
-    setResult: async (id, result) => {
-      await cmd(['LPUSH', `relaybee:result:${id}`, JSON.stringify(result)])
-      await cmd(['EXPIRE', `relaybee:result:${id}`, RESULT_TTL_S])
+    pushResultEvent: async (id, event) => {
+      const key = `relaybee:result:${id}`
+      await pipeline([
+        ['LPUSH', key, JSON.stringify(event)],
+        ['EXPIRE', key, RESULT_TTL_S],
+      ])
     },
     // The same blocking read on the other side of the relay: one command per 15s
     // of waiting instead of two GETs a second. That is what makes a long wait
     // affordable, and a long wait is what real answers need.
-    waitResult: (id, maxWaitMs) =>
-      brpopUntil<Result>(cmd, [`relaybee:result:${id}`], maxWaitMs, decodeResult),
+    waitResultEvent: (id, maxWaitMs) =>
+      brpopUntil<ResultEvent>(cmd, [`relaybee:result:${id}`], maxWaitMs, decodeResultEvent),
     // One command per poll, and a sweep only on the poll that grows the set.
     // ZADD returns 1 for a member the set did not already have, which is the
     // only way it gets bigger, so this ties the cleanup rate to the mess rate.
@@ -222,7 +248,7 @@ function memoryStore(): Store {
     if (!l) { l = []; queues.set(q, l) }
     return l
   }
-  const results = new Map<string, { result: Result; at: number }>()
+  const results = new Map<string, Array<{ event: ResultEvent; at: number }>>()
   const presence = new Map<string, number>()
   const publicPresence = new Map<string, number>()
 
@@ -267,22 +293,25 @@ function memoryStore(): Store {
         await sleep(500)
       }
     },
-    setResult: async (id, result) => {
+    pushResultEvent: async (id, event) => {
       const now = Date.now()
       // Opportunistic sweep so read-once and orphaned answers don't accumulate.
       if (results.size > 500) {
-        for (const [k, v] of results) if (now - v.at > RESULT_TTL_S * 1000) results.delete(k)
+        for (const [k, events] of results) if (!events.length || now - events.at(-1)!.at > RESULT_TTL_S * 1000) results.delete(k)
       }
-      results.set(id, { result, at: now })
+      const events = results.get(id) ?? []
+      events.push({ event, at: now })
+      results.set(id, events)
     },
     // In-process, so polling costs nothing. Reads once, matching BRPOP.
-    waitResult: async (id, maxWaitMs) => {
+    waitResultEvent: async (id, maxWaitMs) => {
       const deadline = Date.now() + maxWaitMs
       while (true) {
-        const r = results.get(id)
-        if (r) {
-          results.delete(id)
-          if (Date.now() - r.at <= RESULT_TTL_S * 1000) return r.result
+        const events = results.get(id)
+        const next = events?.shift()
+        if (events?.length === 0) results.delete(id)
+        if (next) {
+          if (Date.now() - next.at <= RESULT_TTL_S * 1000) return next.event
         }
         if (Date.now() >= deadline) return null
         await sleep(100)
@@ -300,6 +329,42 @@ function memoryStore(): Store {
     },
     countPresent: async () => countFresh(presence),
     countPresentPublic: async () => countFresh(publicPresence),
+  }
+}
+
+export type QueueBackend = 'upstash' | 'memory' | 'unconfigured'
+
+/**
+ * Choose the queue deliberately. Local development keeps the zero-setup memory
+ * store, but an edge deployment must have shared state: two requests are free
+ * to land on different isolates. Partial Upstash configuration is always an
+ * error so a mistyped secret cannot silently downgrade production.
+ */
+export function queueBackendFor(env: Record<string, string | undefined>): QueueBackend {
+  const hasUrl = Boolean(env.UPSTASH_REDIS_REST_URL)
+  const hasToken = Boolean(env.UPSTASH_REDIS_REST_TOKEN)
+  if (hasUrl && hasToken) return 'upstash'
+  if (hasUrl || hasToken) return 'unconfigured'
+  if (env.VERCEL === '1' || env.VERCEL_ENV === 'production' || env.RELAYBEE_REQUIRE_DISTRIBUTED_QUEUE === '1') {
+    return 'unconfigured'
+  }
+  return 'memory'
+}
+
+function unconfiguredStore(): Store {
+  const fail = async (): Promise<never> => {
+    throw new Error('A distributed queue is required in production; configure both Upstash Redis REST variables')
+  }
+  return {
+    push: fail,
+    remove: fail,
+    waitPop: fail,
+    pushResultEvent: fail,
+    waitResultEvent: fail,
+    markPresence: fail,
+    isPresent: fail,
+    countPresent: fail,
+    countPresentPublic: fail,
   }
 }
 
@@ -324,8 +389,13 @@ async function signTicket(jobId: string, supporter: string): Promise<string> {
 
 const url = process.env.UPSTASH_REDIS_REST_URL
 const token = process.env.UPSTASH_REDIS_REST_TOKEN
-export const QUEUE_DISTRIBUTED = Boolean(url && token)
-const store: Store = QUEUE_DISTRIBUTED ? upstashStore(url!, token!) : memoryStore()
+export const QUEUE_BACKEND = queueBackendFor(process.env)
+export const QUEUE_DISTRIBUTED = QUEUE_BACKEND === 'upstash'
+const store: Store = QUEUE_BACKEND === 'upstash'
+  ? upstashStore(url!, token!)
+  : QUEUE_BACKEND === 'memory'
+    ? memoryStore()
+    : unconfiguredStore()
 
 /**
  * Queue a job for whoever can serve it.
@@ -432,12 +502,60 @@ export async function countLivePublic(): Promise<number> {
  * popped the job; see issueTicket and checkTicket above.
  */
 export async function completeJob(id: string, text: string, usage?: Usage): Promise<void> {
-  await store.setResult(id, usage ? { text, usage } : { text })
+  await store.pushResultEvent(id, { type: 'complete', result: usage ? { text, usage } : { text } })
+}
+
+/** Append one incremental answer frame. The ticket is checked by the HTTP endpoint. */
+export async function appendResultDelta(id: string, text: string): Promise<void> {
+  await store.pushResultEvent(id, { type: 'delta', text })
+}
+
+/** Mark an incremental answer complete and attach the node's final accounting. */
+export async function finishResultStream(id: string, usage?: Usage): Promise<void> {
+  await store.pushResultEvent(id, usage ? { type: 'done', usage } : { type: 'done' })
+}
+
+/** End an incremental answer unsuccessfully without presenting partial text as complete. */
+export async function failResultStream(id: string, message: string): Promise<void> {
+  await store.pushResultEvent(id, { type: 'error', message })
+}
+
+/** Wait for a single supporter frame; streaming callers consume this directly. */
+export async function awaitResultEvent(id: string, maxWaitMs: number): Promise<ResultEvent | null> {
+  return store.waitResultEvent(id, maxWaitMs)
 }
 
 /** Wait for a supporter's answer on behalf of the requesting user. */
 export async function awaitResult(id: string, maxWaitMs: number): Promise<Result | null> {
-  return store.waitResult(id, maxWaitMs)
+  const deadline = Date.now() + maxWaitMs
+  let text = ''
+  for (;;) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return null
+    const event = await store.waitResultEvent(id, remaining)
+    if (event === null) return null
+    if (event.type === 'complete') return event.result
+    if (event.type === 'delta') {
+      text += event.text
+      if (new TextEncoder().encode(text).length > MAX_RESULT_BYTES) throw new Error('streamed answer exceeds the result size cap')
+    }
+    if (event.type === 'error') throw new ResultStreamError(event.message)
+    if (event.type === 'done') return { text, ...(event.usage ? { usage: event.usage } : {}) }
+  }
+}
+
+function decodeResultEvent(raw: string): ResultEvent {
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (parsed && typeof parsed === 'object') {
+      const event = parsed as ResultEvent
+      if (event.type === 'delta' && typeof event.text === 'string') return event
+      if (event.type === 'done') return event
+      if (event.type === 'error' && typeof event.message === 'string') return event
+      if (event.type === 'complete' && typeof event.result?.text === 'string') return event
+    }
+  } catch { /* legacy result below */ }
+  return { type: 'complete', result: decodeResult(raw) }
 }
 
 /**

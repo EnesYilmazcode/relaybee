@@ -12,7 +12,7 @@
 // command, and it cannot be replayed by a different key.
 
 import { verifyKey, bearer } from '../../lib/auth'
-import { completeJob, checkTicket, type Usage } from '../../lib/queue'
+import { completeJob, checkTicket, MAX_RESULT_BYTES, type Usage } from '../../lib/queue'
 import { check, clientIp, rlHeaders } from '../../lib/ratelimit'
 import { corsFor } from '../../lib/cors'
 
@@ -26,7 +26,6 @@ const CORS_BASE = {
   'access-control-expose-headers': 'x-ratelimit-limit, x-ratelimit-remaining, x-ratelimit-reset',
 }
 
-const MAX_ANSWER_BYTES = 64 * 1024
 const IP_COMPLETE_LIMIT = 30
 
 const jsonFor = (req: Request) => (status: number, obj: unknown, extra: Record<string, string> = {}) =>
@@ -44,7 +43,7 @@ const jsonFor = (req: Request) => (status: number, obj: unknown, extra: Record<s
  * that matters. So anything that is not three sane finite numbers is dropped
  * and the answer goes through without a usage block, exactly as before.
  */
-function readUsage(raw: unknown): Usage | undefined {
+export function readUsage(raw: unknown): Usage | undefined {
   if (!raw || typeof raw !== 'object') return undefined
   const u = raw as Record<string, unknown>
   const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null)
@@ -93,8 +92,8 @@ export default async function handler(req: Request): Promise<Response> {
     return json(403, { error: { message: 'That ticket was not issued to this key for this job.', type: 'permission_error' } }, rlh)
   }
   if (!text) return json(400, { error: { message: 'Field "text" is required.' } }, rlh)
-  if (new TextEncoder().encode(text).length > MAX_ANSWER_BYTES) {
-    return json(400, { error: { message: `Answer too large: cap is ${MAX_ANSWER_BYTES / 1024}KB.` } }, rlh)
+  if (new TextEncoder().encode(text).length > MAX_RESULT_BYTES) {
+    return json(400, { error: { message: `Answer too large: cap is ${MAX_RESULT_BYTES / 1024}KB.` } }, rlh)
   }
 
   try {

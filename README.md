@@ -82,6 +82,21 @@ own use and answering strangers is the part it does not cover. `--bare` reads th
 touches OAuth or the keychain, so a node cannot spend a Pro/Max seat even by accident. Cost is bounded at both ends: `--max-budget-usd` caps a single job, and the loop stops itself after
 `MAXJOBS` jobs (100 by default, set `RELAYBEE_MAX_JOBS` to change it) so the total is finite too.
 
+For the lower-overhead, incrementally streamed worker included in this repository, run:
+
+```bash
+ANTHROPIC_API_KEY=... node scripts/supporter.mjs --key rb_live_... --pool public \
+  --model claude-haiku-4-5-20251001 --donated-budget-usd 5 --max-output-tokens 1024
+```
+
+This path calls the Messages API directly instead of booting a coding agent for every question, so
+short prompts do not inherit the coding agent's fixed context. The first text delta is
+forwarded immediately and later deltas are lightly batched. The node stops before taking another job
+after its reported donated-dollar budget is reached. Token counts and estimated cost travel to the
+caller; override `--input-usd-per-million` and `--output-usd-per-million` when the selected model's
+pricing differs from the defaults. The budget is intentionally a post-job ceiling, so the final job
+can cross it; `--max-output-tokens` and `--max-jobs` are the hard prospective bounds.
+
 Claude reads [`/llms.txt`](https://relaybee.vercel.app/llms.txt), mints its own key, and leaves a
 loop polling in the background. There is nothing to paste and no key to copy. That key is the one
 thing worth understanding about this path: the node serves the queue of the key it minted, not the
@@ -206,6 +221,7 @@ For a fuller tour of the design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md
 | GET | `/api/v1/models` | List callable models, and the providers you can route to |
 | POST | `/api/work/next` | Supporter: ask for the next job |
 | POST | `/api/work/complete` | Supporter: send back an answer, with the ticket the poll issued |
+| POST | `/api/work/stream` | Supporter: append a text delta or finish an incremental answer |
 | GET | `/api/work/status` | Is a node of your own online, and how many are online in total |
 | GET | `/api/health` | Liveness |
 
@@ -215,9 +231,10 @@ For a fuller tour of the design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md
   polls with `{"pool":"public"}`. When both do, that supporter can read the prompts they answer and
   the caller can read their answer. The relay is a trust relationship there, and `/llms.txt` says
   so, which is the file a supporter's agent reads and follows before it runs anything.
-- The relay uses an in-memory queue unless Upstash is set, so on the free tier a caller and a
-  supporter only meet if they land on the same server. Set `UPSTASH_REDIS_REST_URL` and
-  `UPSTASH_REDIS_REST_TOKEN` to make it work everywhere.
+- Local development uses an in-memory queue unless Upstash is set. Serverless production requires
+  `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` and fails closed without both, because a
+  caller and a node may land on different edge instances. On another serverless host, set
+  `RELAYBEE_REQUIRE_DISTRIBUTED_QUEUE=1` to enforce the same deployment guard.
 - `/api/keys/issue` and `/api/work/*` answer same-origin callers only. They hand back a bearer
   key or a queued job, so they no longer reply to every origin with `*`. A front end on another
   domain needs its origin named in `RELAYBEE_ALLOWED_ORIGINS`, comma separated and matched

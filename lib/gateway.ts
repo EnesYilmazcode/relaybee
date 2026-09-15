@@ -9,7 +9,7 @@ import { verifyKey, bearer } from './auth'
 import { open, type Connection } from './seal'
 import { route, ADAPTERS, type ChatRequest } from './providers'
 import { check, LIMITS, clientIp, IP_PROXY_LIMIT, PUBLIC_POOL_LIMIT, rlHeaders } from './ratelimit'
-import { submitJob, awaitResult, cancelJob, countLivePublic, isLive, type Job, type Usage, type Pool } from './queue'
+import { submitJob, awaitResult, awaitResultEvent, cancelJob, countLivePublic, isLive, MAX_RESULT_BYTES, ResultStreamError, type Job, type Usage, type Pool } from './queue'
 import { hasSecrets, NOT_CONFIGURED } from './config'
 
 const CORS = {
@@ -102,8 +102,8 @@ export async function listModels(req: Request): Promise<Response> {
 
 // "claude-code/<anything>" routes to the supporter queue instead of a provider:
 // the request needs no connection blobs, because supporters' machines are the
-// capacity. Non-streaming in substance; stream:true gets the finished answer as
-// a single SSE chunk so OpenAI clients that always stream still work.
+// capacity. New workers upload incremental frames; old workers can still send a
+// finished answer through /api/work/complete.
 const RELAY_PROVIDER = 'claude-code'
 // "claude-code" goes to the caller's own nodes. "claude-code/public" offers the
 // job to anyone running a node that has opted into the shared pool.
@@ -229,8 +229,11 @@ async function relayCompletion(req: Request, body: ChatRequest, owner: string, h
   let result: Awaited<ReturnType<typeof awaitResult>>
   try {
     result = await awaitResult(job.id, RELAY_WAIT_MS)
-  } catch {
-    return err(502, 'The relay queue is temporarily unavailable. Try again shortly.', 'api_error', headers)
+  } catch (e) {
+    const message = e instanceof ResultStreamError
+      ? e.message
+      : 'The relay queue is temporarily unavailable. Try again shortly.'
+    return err(502, message, 'api_error', headers)
   }
   if (result === null) {
     // Nobody is waiting for this any more. Leaving it queued means the next
@@ -308,18 +311,44 @@ function relayStream(job: Job, body: ChatRequest, owner: string, pool: Pool, cre
       send(frame(chunk({ role: 'assistant' }, null)))
 
       const deadline = Date.now() + RELAY_STREAM_WAIT_MS
-      let result: Awaited<ReturnType<typeof awaitResult>> = null
+      let finished = false
+      let usage: Usage | undefined
+      let deliveredBytes = 0
+      let streamError: string | undefined
       let online: Serving | undefined
       let checked = false
 
       while (Date.now() < deadline) {
         const slice = Math.min(RELAY_SLICE_MS, deadline - Date.now())
+        let event: Awaited<ReturnType<typeof awaitResultEvent>>
         try {
-          result = await awaitResult(job.id, slice)
+          event = await awaitResultEvent(job.id, slice)
         } catch {
           break
         }
-        if (result !== null) break
+        if (event !== null) {
+          if (event.type === 'delta') {
+            deliveredBytes += encoder.encode(event.text).length
+            if (deliveredBytes > MAX_RESULT_BYTES) {
+              streamError = `The supporter answer exceeded the ${MAX_RESULT_BYTES / 1024}KB limit.`
+              break
+            }
+            send(frame(chunk({ content: event.text }, null)))
+            continue
+          }
+          if (event.type === 'error') {
+            streamError = event.message
+            break
+          }
+          if (event.type === 'complete') {
+            send(frame(chunk({ content: event.result.text }, null)))
+            usage = event.result.usage
+          } else {
+            usage = event.usage
+          }
+          finished = true
+          break
+        }
         // One presence check, after the first empty slice. If nothing is polling
         // the queue then no answer is coming, and holding the caller for the
         // full window would be a worse experience than the old 20s cap. Only a
@@ -334,11 +363,10 @@ function relayStream(job: Job, body: ChatRequest, owner: string, pool: Pool, cre
         send(': waiting for a supporter\n\n')
       }
 
-      if (result === null) {
+      if (!finished) {
         await cancelJob(job, owner, pool).catch(() => {})
-        send(frame({ error: { message: await timedOutMessage(owner, pool, online), type: 'api_error' } }))
+        send(frame({ error: { message: streamError ?? await timedOutMessage(owner, pool, online), type: 'api_error' } }))
       } else {
-        send(frame(chunk({ content: result.text }, null)))
         send(frame(chunk({}, 'stop')))
         // OpenAI convention, and the same one the provider path already follows:
         // a trailing usage chunk only when the caller opted in. Its choices array
@@ -346,7 +374,7 @@ function relayStream(job: Job, body: ChatRequest, owner: string, pool: Pool, cre
         if (includeUsage) {
           send(frame({
             id: `chatcmpl-${job.id}`, object: 'chat.completion.chunk', created, model: body.model,
-            choices: [], usage: openaiUsage(result.usage),
+            choices: [], usage: openaiUsage(usage),
           }))
         }
       }
