@@ -53,6 +53,28 @@ const res = await relaybee.chat.completions.create({
 })
 ```
 
+The equivalent setup with the official Python client is:
+
+```python
+import os
+from openai import OpenAI
+
+relaybee = OpenAI(
+    base_url="https://relaybee.vercel.app/api/v1",
+    api_key=os.environ["RELAYBEE_KEY"],
+    default_headers={
+        "X-Relaybee-Connection": os.environ["RELAYBEE_CONNECTIONS"],
+    },
+)
+
+response = relaybee.chat.completions.create(
+    model="anthropic/claude-opus-5",
+    messages=[{"role": "user", "content": "hi"}],
+)
+
+print(response.choices[0].message.content)
+```
+
 Models are named `provider/model`, like `anthropic/claude-opus-5`, `openai/gpt-4o`, or
 `groq/llama-3.3-70b-versatile`. Use `claude-code` to go through the relay to a node of your own, or
 `claude-code/public` to offer the job to anyone running a node in the shared pool.

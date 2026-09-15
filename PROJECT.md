@@ -4,9 +4,9 @@ Living status doc. Updated in the same commit as the change it describes, so the
 stale relative to the code. Newest entries at the top of each log.
 
 **Status:** deployed, and the relay is verified end to end on production rather than only in local
-tests. The private-pools round landed as #100 and the CORS allowlist as #101. PR #117 is in review
-with the serverless queue guard, pipelined queue writes, direct donated-API budgets and accounting,
-and incremental supporter frames. The relay's direction is decided (see the #76 section below:
+tests. The serverless queue and incremental donated-API round landed as #117. The MIT license and
+Python client documentation follow-up is in review as #118. The relay's direction
+is decided (see the #76 section below:
 the public pool stays, opt-in and empty by default). **One thing still wants a
 decision: whether to rotate `MASTER_SECRET` over the key leaked in `test_ascii_art.py`.** That
 key is valid until 2026-10-31 and rotation is the only lever, which invalidates every key in
@@ -22,7 +22,7 @@ existence.
 
 | Item | Branch / PR |
 |---|---|
-| Fail-closed serverless queue configuration, pipelined queue writes, direct donated Anthropic API budgets/accounting, and incremental worker frames | `perf/serverless-queue-guard` ([#117](https://github.com/EnesYilmazcode/relaybee/pull/117)) |
+| Add an MIT license and an official Python client example, resolving #110 and #111 | `docs/resolve-110-111` ([#118](https://github.com/EnesYilmazcode/relaybee/pull/118)) |
 
 ### Shipped
 
@@ -116,6 +116,7 @@ existence.
 | 86 | `SECURITY.md` and `lib/queue.ts` stopped calling the job id the capability, which the ticket replaced | `docs` (#100) |
 | 87 | The endpoints that hand back a key or a job answer named origins instead of `*`, so a page a visitor loads can no longer read a minted key out of their browser | `fix(web)` (#101) |
 | 88 | The public pool has a best-effort per-instance throttle per key and source, reducing repeated claims on volunteer capacity; the two spend figures the board quotes are pinned rather than grepped for | `fix(relay)` (#103) |
+| 89 | Serverless queue configuration fails closed, queue writes are pipelined, donated API capacity is budgeted and accounted, and supporter tokens stream incrementally | `feat(relay)` (#117) |
 
 ### Resolved: Relaybee is a personal capacity router
 
