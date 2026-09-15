@@ -30,6 +30,14 @@ export type Usage = {
 }
 
 export type Result = { text: string; usage?: Usage }
+export const MAX_RESULT_BYTES = 64 * 1024
+export type ResultEvent =
+  | { type: 'delta'; text: string }
+  | { type: 'done'; usage?: Usage }
+  | { type: 'error'; message: string }
+  | { type: 'complete'; result: Result }
+
+export class ResultStreamError extends Error {}
 
 const RESULT_TTL_S = 120
 const NODES_KEY = 'relaybee:nodes'
@@ -87,9 +95,9 @@ interface Store {
   remove(queue: string, job: Job): Promise<void>
   /** Block on every listed queue at once until a job arrives or maxWaitMs elapses. */
   waitPop(queues: string[], maxWaitMs: number): Promise<Job | null>
-  setResult(id: string, result: Result): Promise<void>
-  /** Block until this job's answer arrives or maxWaitMs elapses. */
-  waitResult(id: string, maxWaitMs: number): Promise<Result | null>
+  pushResultEvent(id: string, event: ResultEvent): Promise<void>
+  /** Block until this job's next answer event arrives or maxWaitMs elapses. */
+  waitResultEvent(id: string, maxWaitMs: number): Promise<ResultEvent | null>
   markPresence(userId: string, watchesPublic: boolean): Promise<void>
   isPresent(userId: string): Promise<boolean>
   countPresent(): Promise<number>
@@ -181,18 +189,18 @@ function upstashStore(url: string, token: string): Store {
       }),
     // The answer is a one-element list rather than a plain string so the waiting
     // caller can BRPOP it instead of polling GET twice a second.
-    setResult: async (id, result) => {
+    pushResultEvent: async (id, event) => {
       const key = `relaybee:result:${id}`
       await pipeline([
-        ['LPUSH', key, JSON.stringify(result)],
+        ['LPUSH', key, JSON.stringify(event)],
         ['EXPIRE', key, RESULT_TTL_S],
       ])
     },
     // The same blocking read on the other side of the relay: one command per 15s
     // of waiting instead of two GETs a second. That is what makes a long wait
     // affordable, and a long wait is what real answers need.
-    waitResult: (id, maxWaitMs) =>
-      brpopUntil<Result>(cmd, [`relaybee:result:${id}`], maxWaitMs, decodeResult),
+    waitResultEvent: (id, maxWaitMs) =>
+      brpopUntil<ResultEvent>(cmd, [`relaybee:result:${id}`], maxWaitMs, decodeResultEvent),
     // One command per poll, and a sweep only on the poll that grows the set.
     // ZADD returns 1 for a member the set did not already have, which is the
     // only way it gets bigger, so this ties the cleanup rate to the mess rate.
@@ -240,7 +248,7 @@ function memoryStore(): Store {
     if (!l) { l = []; queues.set(q, l) }
     return l
   }
-  const results = new Map<string, { result: Result; at: number }>()
+  const results = new Map<string, Array<{ event: ResultEvent; at: number }>>()
   const presence = new Map<string, number>()
   const publicPresence = new Map<string, number>()
 
@@ -285,22 +293,25 @@ function memoryStore(): Store {
         await sleep(500)
       }
     },
-    setResult: async (id, result) => {
+    pushResultEvent: async (id, event) => {
       const now = Date.now()
       // Opportunistic sweep so read-once and orphaned answers don't accumulate.
       if (results.size > 500) {
-        for (const [k, v] of results) if (now - v.at > RESULT_TTL_S * 1000) results.delete(k)
+        for (const [k, events] of results) if (!events.length || now - events.at(-1)!.at > RESULT_TTL_S * 1000) results.delete(k)
       }
-      results.set(id, { result, at: now })
+      const events = results.get(id) ?? []
+      events.push({ event, at: now })
+      results.set(id, events)
     },
     // In-process, so polling costs nothing. Reads once, matching BRPOP.
-    waitResult: async (id, maxWaitMs) => {
+    waitResultEvent: async (id, maxWaitMs) => {
       const deadline = Date.now() + maxWaitMs
       while (true) {
-        const r = results.get(id)
-        if (r) {
-          results.delete(id)
-          if (Date.now() - r.at <= RESULT_TTL_S * 1000) return r.result
+        const events = results.get(id)
+        const next = events?.shift()
+        if (events?.length === 0) results.delete(id)
+        if (next) {
+          if (Date.now() - next.at <= RESULT_TTL_S * 1000) return next.event
         }
         if (Date.now() >= deadline) return null
         await sleep(100)
@@ -348,8 +359,8 @@ function unconfiguredStore(): Store {
     push: fail,
     remove: fail,
     waitPop: fail,
-    setResult: fail,
-    waitResult: fail,
+    pushResultEvent: fail,
+    waitResultEvent: fail,
     markPresence: fail,
     isPresent: fail,
     countPresent: fail,
@@ -491,12 +502,60 @@ export async function countLivePublic(): Promise<number> {
  * popped the job; see issueTicket and checkTicket above.
  */
 export async function completeJob(id: string, text: string, usage?: Usage): Promise<void> {
-  await store.setResult(id, usage ? { text, usage } : { text })
+  await store.pushResultEvent(id, { type: 'complete', result: usage ? { text, usage } : { text } })
+}
+
+/** Append one incremental answer frame. The ticket is checked by the HTTP endpoint. */
+export async function appendResultDelta(id: string, text: string): Promise<void> {
+  await store.pushResultEvent(id, { type: 'delta', text })
+}
+
+/** Mark an incremental answer complete and attach the node's final accounting. */
+export async function finishResultStream(id: string, usage?: Usage): Promise<void> {
+  await store.pushResultEvent(id, usage ? { type: 'done', usage } : { type: 'done' })
+}
+
+/** End an incremental answer unsuccessfully without presenting partial text as complete. */
+export async function failResultStream(id: string, message: string): Promise<void> {
+  await store.pushResultEvent(id, { type: 'error', message })
+}
+
+/** Wait for a single supporter frame; streaming callers consume this directly. */
+export async function awaitResultEvent(id: string, maxWaitMs: number): Promise<ResultEvent | null> {
+  return store.waitResultEvent(id, maxWaitMs)
 }
 
 /** Wait for a supporter's answer on behalf of the requesting user. */
 export async function awaitResult(id: string, maxWaitMs: number): Promise<Result | null> {
-  return store.waitResult(id, maxWaitMs)
+  const deadline = Date.now() + maxWaitMs
+  let text = ''
+  for (;;) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return null
+    const event = await store.waitResultEvent(id, remaining)
+    if (event === null) return null
+    if (event.type === 'complete') return event.result
+    if (event.type === 'delta') {
+      text += event.text
+      if (new TextEncoder().encode(text).length > MAX_RESULT_BYTES) throw new Error('streamed answer exceeds the result size cap')
+    }
+    if (event.type === 'error') throw new ResultStreamError(event.message)
+    if (event.type === 'done') return { text, ...(event.usage ? { usage: event.usage } : {}) }
+  }
+}
+
+function decodeResultEvent(raw: string): ResultEvent {
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (parsed && typeof parsed === 'object') {
+      const event = parsed as ResultEvent
+      if (event.type === 'delta' && typeof event.text === 'string') return event
+      if (event.type === 'done') return event
+      if (event.type === 'error' && typeof event.message === 'string') return event
+      if (event.type === 'complete' && typeof event.result?.text === 'string') return event
+    }
+  } catch { /* legacy result below */ }
+  return { type: 'complete', result: decodeResult(raw) }
 }
 
 /**

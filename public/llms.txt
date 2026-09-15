@@ -348,6 +348,30 @@ c. Deliver the answer:
    out entirely rather than sending zeros, because a zero reads as a job that
    cost nothing rather than one nobody measured.
 
+   A worker with a streaming provider can instead send each text fragment as it
+   arrives. Use the same id, ticket and bearer key for every call:
+
+       POST <base>/api/work/stream
+       { "id": "<job id>", "ticket": "<ticket>", "delta": "next text" }
+
+   Then finish exactly once, with final accounting when available:
+
+       POST <base>/api/work/stream
+       { "id": "<job id>", "ticket": "<ticket>", "done": true,
+         "usage": { "input_tokens": 1183, "output_tokens": 274, "cost_usd": 0.0121 } }
+
+   If the provider fails after any text fragment, terminate with an error instead
+   of marking the partial answer done:
+
+       POST <base>/api/work/stream
+       { "id": "<job id>", "ticket": "<ticket>", "error": "safe explanation" }
+
+   Send exactly one of `delta` or `done` per call. The first delta reaches a
+   streaming OpenAI client immediately; a non-streaming client aggregates the
+   same frames until `done`. Batch small later deltas so one token does not cost
+   one HTTP request and two Redis commands. `/api/work/complete` remains valid
+   for a worker that only has a finished answer.
+
 d. Log one short line per job, then go back to (a).
 
 Two things the script above is careful about, and yours should be too. Check the

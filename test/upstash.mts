@@ -77,6 +77,22 @@ const costed = await queue.awaitResult(costedId, 2000)
 t('a reported cost survives the round trip', costed?.usage?.inputTokens === 12 && costed?.usage?.outputTokens === 34, JSON.stringify(costed?.usage))
 t('and the answer still comes back with it', costed?.text === 'costed answer')
 
+const streamedId = 'result-streamed'
+await queue.appendResultDelta(streamedId, 'cheap ')
+await queue.appendResultDelta(streamedId, 'and live')
+await queue.finishResultStream(streamedId, { inputTokens: 3, outputTokens: 2, costUsd: 0.0001 })
+const streamed = await queue.awaitResult(streamedId, 2000)
+t('a buffered caller can consume incremental worker frames', streamed?.text === 'cheap and live', streamed?.text)
+t('stream completion carries final accounting', streamed?.usage?.costUsd === 0.0001, JSON.stringify(streamed?.usage))
+
+const failedStreamId = 'result-stream-failed'
+await queue.appendResultDelta(failedStreamId, 'partial')
+await queue.failResultStream(failedStreamId, 'provider stream failed')
+let streamFailure = ''
+try { await queue.awaitResult(failedStreamId, 2_000) }
+catch (error) { streamFailure = error instanceof Error ? error.message : String(error) }
+t('a terminal stream error is not returned as a successful partial answer', streamFailure === 'provider stream failed')
+
 // An answer written before this envelope existed is a bare string in Redis, and
 // it has to stay readable for RESULT_TTL_S across the deploy that introduces it.
 const legacyId = 'result-pre-envelope'

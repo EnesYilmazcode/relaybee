@@ -81,6 +81,17 @@ ordinary Relaybee key, and what that key hands it is the jobs filed under that
 same key, so its own queue is the whole of its access. The answer flows back to
 the waiting caller, shaped like an ordinary OpenAI completion.
 
+Workers can deliver in either of two compatible forms. Older workers post one finished answer to
+`/api/work/complete`. Streaming workers post text deltas and a final usage frame to
+`/api/work/stream`; each delta is appended to the result list, and the caller's existing blocking
+read receives it immediately. Streaming callers get one OpenAI content chunk per worker frame,
+while buffered callers aggregate the same events until the final frame. The ticket is checked on
+every write. A provider failure after partial output sends a terminal error frame, so incomplete
+text is never labelled as a successful answer. The bundled API-funded worker sends the first
+provider delta immediately and batches
+later small deltas, avoiding coding-agent context overhead without turning every token into a Redis
+request.
+
 `claude-code/public` is the way out of that. It parks the job on one shared pool
 instead, which a node joins by sending `{"pool":"public"}` as the body of its
 poll. Both halves are named on purpose. There used to be a single global list,

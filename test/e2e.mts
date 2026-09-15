@@ -19,6 +19,7 @@ const connect = (await import('../api/connect.ts')).default
 const chat = (await import('../api/v1/chat/completions.ts')).default
 const workNext = (await import('../api/work/next.ts')).default
 const workComplete = (await import('../api/work/complete.ts')).default
+const workStream = (await import('../api/work/stream.ts')).default
 const workStatus = (await import('../api/work/status.ts')).default
 const health = (await import('../api/health.ts')).default
 const { serveRoutes } = await import('./local-server.mts')
@@ -30,6 +31,7 @@ const routes: Routes = {
   'POST /api/v1/chat/completions': chat,
   'POST /api/work/next': workNext,
   'POST /api/work/complete': workComplete,
+  'POST /api/work/stream': workStream,
   'GET /api/work/status': workStatus,
   'GET /api/health': health,
 }
@@ -69,6 +71,21 @@ async function supporter(key: string) {
     const last = job.messages.at(-1)?.content ?? ''
     served.push(last)
     if (answerDelayMs) await new Promise((r) => setTimeout(r, answerDelayMs))
+    if (last === 'incremental-please') {
+      await post('/api/work/stream', { id: job.id, ticket: job.ticket, delta: 'SUPPORTER_' }, auth)
+      await new Promise((r) => setTimeout(r, 120))
+      await post('/api/work/stream', { id: job.id, ticket: job.ticket, delta: `REPLY: ${last}` }, auth)
+      await post('/api/work/stream', {
+        id: job.id, ticket: job.ticket, done: true,
+        usage: { input_tokens: 5, output_tokens: 7, cost_usd: 0.0002 },
+      }, auth)
+      continue
+    }
+    if (last.startsWith('incremental-error-')) {
+      await post('/api/work/stream', { id: job.id, ticket: job.ticket, delta: 'PARTIAL' }, auth)
+      await post('/api/work/stream', { id: job.id, ticket: job.ticket, error: 'provider stream failed' }, auth)
+      continue
+    }
     // The ticket, not just the id, is what proves this node took the job.
     await post('/api/work/complete', { id: job.id, ticket: job.ticket, text: `SUPPORTER_REPLY: ${last}` }, auth)
   }
@@ -86,6 +103,11 @@ const clientAuth = { authorization: `Bearer ${KEY}`, 'x-forwarded-for': '10.0.0.
 // it now, but start the worker AFTER the failure-mode block below — several of
 // those cases (especially the 504) depend on there being no supporter online.
 const supKey = (await (await post('/api/keys/issue', {}, { 'x-forwarded-for': '10.0.0.1' })).json()).key
+
+const forgedStream = await post('/api/work/stream', {
+  id: crypto.randomUUID(), ticket: 'not-a-worker-ticket', delta: 'forged',
+}, clientAuth)
+t('incremental frames require the job-specific worker ticket', forgedStream.status === 403)
 
 // --- failure modes over real HTTP --------------------------------------------
 // Run while nothing is polling the relay. (a) needs an empty relay so the wait
@@ -180,6 +202,46 @@ const r2 = await post('/api/v1/chat/completions', {
 const sse = await r2.text()
 t('stream carries the supporter answer', sse.includes('SUPPORTER_REPLY: stream-please'))
 t('stream ends with [DONE]', sse.trimEnd().endsWith('data: [DONE]'))
+
+console.log('\ne2e — supporter frames reach the caller incrementally')
+const incremental = await post('/api/v1/chat/completions', {
+  model: 'claude-code', stream: true, stream_options: { include_usage: true },
+  messages: [{ role: 'user', content: 'incremental-please' }],
+}, clientAuth)
+const incrementalReader = incremental.body!.getReader()
+const incrementalDecoder = new TextDecoder()
+let incrementalSse = '', firstFrameAt = 0, secondFrameAt = 0
+for (;;) {
+  const { done, value } = await incrementalReader.read()
+  if (done) break
+  incrementalSse += incrementalDecoder.decode(value, { stream: true })
+  if (!firstFrameAt && incrementalSse.includes('SUPPORTER_')) firstFrameAt = Date.now()
+  if (!secondFrameAt && incrementalSse.includes('REPLY: incremental-please')) secondFrameAt = Date.now()
+}
+const firstDelta = incrementalSse.indexOf('SUPPORTER_')
+const secondDelta = incrementalSse.indexOf('REPLY: incremental-please')
+t('two worker deltas arrive as two OpenAI content frames',
+  firstDelta >= 0 && secondDelta > firstDelta && (incrementalSse.match(/"content":/g) ?? []).length === 2)
+t('the first worker delta was observable before the second existed',
+  firstFrameAt > 0 && secondFrameAt - firstFrameAt >= 80, `${secondFrameAt - firstFrameAt}ms apart`)
+t('the incremental stream carries final usage', /"total_tokens":12/.test(incrementalSse))
+t('the incremental stream terminates normally', incrementalSse.trimEnd().endsWith('data: [DONE]'))
+
+const failedIncremental = await post('/api/v1/chat/completions', {
+  model: 'claude-code', stream: true,
+  messages: [{ role: 'user', content: 'incremental-error-stream' }],
+}, clientAuth)
+const failedIncrementalSse = await failedIncremental.text()
+t('a provider failure after a delta is an error, not a successful finish',
+  failedIncrementalSse.includes('PARTIAL') && failedIncrementalSse.includes('provider stream failed')
+    && !failedIncrementalSse.includes('"finish_reason":"stop"'))
+
+const failedBuffered = await post('/api/v1/chat/completions', {
+  model: 'claude-code', messages: [{ role: 'user', content: 'incremental-error-buffered' }],
+}, clientAuth)
+const failedBufferedJson = await failedBuffered.json()
+t('a buffered caller also receives the terminal provider error',
+  failedBuffered.status === 502 && failedBufferedJson.error?.message === 'provider stream failed')
 
 // The case that sent this whole change: against production, a real `claude -p`
 // answering a real question took 23.3s and the caller was cut off at 20s, so the

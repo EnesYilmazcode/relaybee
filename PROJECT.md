@@ -4,18 +4,25 @@ Living status doc. Updated in the same commit as the change it describes, so the
 stale relative to the code. Newest entries at the top of each log.
 
 **Status:** deployed, and the relay is verified end to end on production rather than only in local
-tests. The private-pools round landed as #100 and the CORS allowlist as #101, so `main` carries
-both and there is no branch waiting to go in. The relay's direction is decided (see the #76
-section below: the public pool stays, opt-in and empty by default). **One thing still wants a
+tests. The private-pools round landed as #100 and the CORS allowlist as #101. PR #115 is in review
+with the serverless queue guard, pipelined queue writes, direct donated-API budgets and accounting,
+and incremental supporter frames. The relay's direction is decided (see the #76 section below:
+the public pool stays, opt-in and empty by default). **One thing still wants a
 decision: whether to rotate `MASTER_SECRET` over the key leaked in `test_ascii_art.py`.** That
 key is valid until 2026-10-31 and rotation is the only lever, which invalidates every key in
 existence.
 **Live URL:** https://relaybee.vercel.app
-**Last updated:** 2026-09-13
+**Last updated:** 2026-09-15
 
 ---
 
 ## Board
+
+### In review
+
+| Item | Branch / PR |
+|---|---|
+| Fail-closed serverless queue configuration, pipelined queue writes, direct donated Anthropic API budgets/accounting, and incremental worker frames | `perf/serverless-queue-guard` ([#115](https://github.com/EnesYilmazcode/relaybee/pull/115)) |
 
 ### Shipped
 

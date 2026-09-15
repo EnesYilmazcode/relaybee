@@ -10,14 +10,12 @@
 //
 // Zero dependencies, same as the rest of the project. Node 18+ for global fetch.
 //
-// Two rules are carried over from llms.txt deliberately, and neither is optional:
+// Two rules are deliberate, and neither is optional:
 //
-//  1. ANSWERING RUNS ON API BILLING. --bare reads ANTHROPIC_API_KEY and never the
-//     OAuth login or keychain, so a node cannot spend a consumer Pro/Max seat by
-//     accident. A consumer seat licenses Claude to its holder for their own use,
-//     and answering strangers falls outside that. Spend is bounded at both ends:
-//     --max-budget-usd caps one job, --max-jobs caps the total.
-//  2. THE ANSWERING PROCESS IS CONTAINED. Every job's prompt is written by a
+//  1. PUBLIC ANSWERING RUNS DIRECTLY ON A DONATED API KEY. It never reads a
+//     consumer subscription login or keychain. --donated-budget-usd and
+//     --max-jobs bound the donation, while --max-output-tokens bounds each call.
+//  2. THE CLI PATH FOR OWN TRAFFIC IS CONTAINED. Every job's prompt is written by a
 //     stranger. --safe-mode --strict-mcp-config remove MCP servers, skills and
 //     plugins rather than trying to enumerate them, the deny list covers the
 //     built-in tools, the agent runs in a fresh empty directory, and a timeout
@@ -65,6 +63,11 @@ const AGENT = args.get('agent') ?? 'claude'
 const TELEMETRY = args.get('telemetry') ?? null
 const MAX_JOBS = Number(args.get('max-jobs') ?? 100)
 const MAX_BUDGET_USD = args.get('max-budget-usd') ?? '0.50'
+const DONATED_BUDGET_USD = Number(args.get('donated-budget-usd') ?? process.env.RELAYBEE_DONATED_BUDGET_USD ?? 5)
+const DIRECT_MODEL = args.get('model') ?? process.env.RELAYBEE_ANTHROPIC_MODEL ?? 'claude-haiku-4-5-20251001'
+const MAX_OUTPUT_TOKENS = Number(args.get('max-output-tokens') ?? 1024)
+const INPUT_USD_PER_MILLION = Number(args.get('input-usd-per-million') ?? 1)
+const OUTPUT_USD_PER_MILLION = Number(args.get('output-usd-per-million') ?? 5)
 const LABEL = args.get('label') ?? 'node-1'
 // A job the caller has already given up on is not worth a model call. The
 // buffered window is 20s and the streamed one 110s.
@@ -149,6 +152,7 @@ export function parseAgent(raw) {
  * loop can stop rather than answer the rest of the queue with an error message.
  */
 export class AgentFailed extends Error {}
+export class DeliveryFailed extends Error {}
 
 /** Run the local agent on a prompt. Resolves to { text, usage }, or throws. */
 export function ask(prompt, cwd, spawnAgent = spawn) {
@@ -168,6 +172,81 @@ export function ask(prompt, cwd, spawnAgent = spawn) {
     })
     child.stdin.end(prompt)
   })
+}
+
+/** Parse Anthropic SSE frames from arbitrary network chunks. */
+export async function* anthropicEvents(body) {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done }).replace(/\r\n/g, '\n')
+    let boundary
+    while ((boundary = buffer.indexOf('\n\n')) >= 0) {
+      const frame = buffer.slice(0, boundary)
+      buffer = buffer.slice(boundary + 2)
+      const data = frame.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n')
+      if (!data || data === '[DONE]') continue
+      try { yield JSON.parse(data) } catch { /* malformed provider frame: ignore */ }
+    }
+    if (done) break
+  }
+}
+
+/**
+ * Low-overhead donated-capacity path. It calls the Messages API directly rather
+ * than booting a coding agent with thousands of fixed prompt tokens, and sends
+ * each provider text delta to the relay as it arrives.
+ */
+export async function askAnthropic(messages, onDelta, fetchImpl = fetch) {
+  const res = await fetchImpl('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    signal: AbortSignal.timeout(ANSWER_TIMEOUT_MS),
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY ?? '',
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: DIRECT_MODEL,
+      max_tokens: MAX_OUTPUT_TOKENS,
+      stream: true,
+      messages: messages.filter((m) => m.role !== 'system').map((m) => ({
+        role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content,
+      })),
+      ...(messages.some((m) => m.role === 'system')
+        ? { system: messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n\n') }
+        : {}),
+    }),
+  })
+  if (!res.ok || !res.body) throw new AgentFailed(`Anthropic ${res.status}: ${(await res.text()).slice(0, 200)}`)
+
+  const tokenCount = (value) => {
+    const count = Number(value ?? 0)
+    return Number.isFinite(count) && count >= 0 ? count : 0
+  }
+  let text = '', inputTokens = 0, outputTokens = 0, sawStop = false
+  for await (const event of anthropicEvents(res.body)) {
+    if (event?.type === 'error') throw new AgentFailed(event.error?.message ?? 'Anthropic stream failed')
+    if (event?.type === 'message_start') inputTokens = tokenCount(event.message?.usage?.input_tokens)
+    if (event?.type === 'content_block_delta' && event.delta?.type === 'text_delta' && typeof event.delta.text === 'string') {
+      text += event.delta.text
+      await onDelta(event.delta.text)
+    }
+    if (event?.type === 'message_delta') outputTokens = tokenCount(event.usage?.output_tokens ?? outputTokens)
+    if (event?.type === 'message_stop') sawStop = true
+  }
+  if (!sawStop) throw new AgentFailed('Anthropic stream ended before message_stop')
+  if (!text) throw new AgentFailed('Anthropic returned no text')
+  return {
+    text,
+    usage: {
+      input_tokens: inputTokens,
+      output_tokens: outputTokens,
+      cost_usd: (inputTokens * INPUT_USD_PER_MILLION + outputTokens * OUTPUT_USD_PER_MILLION) / 1_000_000,
+    },
+  }
 }
 
 /**
@@ -244,6 +323,15 @@ async function deliver(id, ticket, text, usage) {
   if (!res.ok) throw new Error(`complete ${res.status}: ${(await res.text()).slice(0, 200)}`)
 }
 
+async function deliverStream(id, ticket, payload) {
+  const res = await fetch(`${BASE}/api/work/stream`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${KEY}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ id, ticket, ...payload }),
+  })
+  if (!res.ok) throw new DeliveryFailed(`stream ${res.status}: ${(await res.text()).slice(0, 200)}`)
+}
+
 async function main() {
   // The two flags say opposite things about who this node answers for, and the
   // combination is exactly the accident worth preventing: a node on a consumer
@@ -261,6 +349,13 @@ async function main() {
   // nothing, which reads as a broken relay rather than as a bad argument.
   if (!Number.isFinite(MAX_JOBS) || MAX_JOBS < 1) {
     console.error(`--max-jobs is the total spend bound and needs a positive number, got ${JSON.stringify(args.get('max-jobs'))}.`)
+    process.exit(1)
+  }
+  if (!Number.isFinite(DONATED_BUDGET_USD) || DONATED_BUDGET_USD <= 0 ||
+      !Number.isFinite(MAX_OUTPUT_TOKENS) || MAX_OUTPUT_TOKENS < 1 ||
+      !Number.isFinite(INPUT_USD_PER_MILLION) || INPUT_USD_PER_MILLION < 0 ||
+      !Number.isFinite(OUTPUT_USD_PER_MILLION) || OUTPUT_USD_PER_MILLION < 0) {
+    console.error('Donation budget and token cap must be positive; model prices must be finite and non-negative.')
     process.exit(1)
   }
   if (!OWN_TRAFFIC_ONLY && !process.env.ANTHROPIC_API_KEY) {
@@ -285,15 +380,18 @@ async function main() {
 
   // A fresh empty directory per node, so a path a prompt names finds nothing.
   const cwd = await mkdtemp(join(tmpdir(), 'relaybee-supporter-'))
-  const probe = await proveContainment(cwd)
-  log(`containment proven, the agent answered the canary probe with ${JSON.stringify(probe.slice(0, 40))}`)
-  log(`polling ${BASE} for ${POOL === 'public' ? 'your own jobs and the public pool' : 'your own jobs'}, answering with \`${AGENT} -p\` in ${cwd}, at most ${MAX_JOBS} job(s)`)
+  if (OWN_TRAFFIC_ONLY) {
+    const probe = await proveContainment(cwd)
+    log(`containment proven, the agent answered the canary probe with ${JSON.stringify(probe.slice(0, 40))}`)
+  }
+  log(`polling ${BASE} for ${POOL === 'public' ? 'your own jobs and the public pool' : 'your own jobs'}, at most ${MAX_JOBS} job(s)`)
   if (POOL === 'public') {
-    log('--pool public: strangers can send you prompts and will read your answers.')
+    log(`--pool public: donating up to $${DONATED_BUDGET_USD.toFixed(2)} through ${DIRECT_MODEL}; strangers can send prompts and read answers.`)
   }
   await telemetry({ event: 'node_start', base: BASE, cwd, pool: POOL, ownTrafficOnly: OWN_TRAFFIC_ONLY })
 
   let served = 0
+  let donatedUsd = 0
   let stopAfterThis = false
   while (served < MAX_JOBS) {
     let job
@@ -317,16 +415,43 @@ async function main() {
     const gotAt = now()
     await telemetry({ event: 'job_received', jobId: job.id, model: job.model, queuedAt: job.queuedAt, queueWaitMsWithSkew: gotAt - job.queuedAt, pollWaitMs: gotAt - polledAt })
 
-    let text, usage, ok = true
+    let text, usage, ok = true, incremental = false
     const startedAt = now()
     try {
-      ;({ text, usage } = await ask(render(job.messages), cwd))
+      if (!OWN_TRAFFIC_ONLY) {
+        let pending = '', sentFirst = false, lastFlush = now()
+        const flush = async () => {
+          if (!pending) return
+          const delta = pending
+          pending = ''
+          await deliverStream(job.id, job.ticket, { delta })
+          incremental = true
+          sentFirst = true
+          lastFlush = now()
+        }
+        ;({ text, usage } = await askAnthropic(job.messages, async (delta) => {
+          pending += delta
+          // First visible text goes immediately for real TTFB. Later provider
+          // events are coalesced to avoid one Redis write and HTTP request per
+          // token while still producing multiple frames during a long answer.
+          if (!sentFirst || new TextEncoder().encode(pending).length >= 512 || now() - lastFlush >= 50) await flush()
+        }))
+        await flush()
+      } else {
+        ;({ text, usage } = await ask(render(job.messages), cwd))
+      }
     } catch (e) {
+      if (e instanceof DeliveryFailed) {
+        log('incremental delivery failed:', e.message)
+        await telemetry({ event: 'deliver_error', jobId: job.id, message: e.message })
+        break
+      }
       // Always deliver something. Taking the job removed it from the queue, so
       // going quiet means the caller waits out their whole window for nothing
       // and no other node can pick it up.
       ok = false
-      text = `The supporter node could not answer this one: ${e.message}`
+      const failureMessage = (e instanceof Error ? e.message : String(e)).slice(0, 900)
+      text = `The supporter node could not answer this one: ${failureMessage}`
       // The agent itself reported the failure, so the next job fails the same
       // way. Deliver this one, because taking it removed it from the queue, then
       // stop rather than draining the queue into the same error.
@@ -335,11 +460,21 @@ async function main() {
         log('stopping rather than answering the rest of the queue the same way')
         stopAfterThis = true
       }
+      if (incremental) {
+        try { await deliverStream(job.id, job.ticket, { error: text }) }
+        catch (deliveryError) {
+          log('deliver failed:', deliveryError.message)
+          await telemetry({ event: 'deliver_error', jobId: job.id, message: deliveryError.message })
+        }
+        if (stopAfterThis) break
+        continue
+      }
     }
     const answeredAt = now()
 
     try {
-      await deliver(job.id, job.ticket, text, usage)
+      if (incremental) await deliverStream(job.id, job.ticket, { done: true, usage })
+      else await deliver(job.id, job.ticket, text, usage)
     } catch (e) {
       log('deliver failed:', e.message)
       await telemetry({ event: 'deliver_error', jobId: job.id, message: e.message })
@@ -349,6 +484,7 @@ async function main() {
     const deliveredAt = now()
 
     served++
+    if (!OWN_TRAFFIC_ONLY && usage) donatedUsd += usage.cost_usd
     await telemetry({
       event: 'job_served', jobId: job.id, ok,
       queueWaitMsWithSkew: gotAt - job.queuedAt,
@@ -361,6 +497,11 @@ async function main() {
     })
     const cost = usage ? `, ${usage.input_tokens} in / ${usage.output_tokens} out, $${usage.cost_usd.toFixed(4)}` : ''
     log(`served ${job.id.slice(0, 8)} in ${((deliveredAt - gotAt) / 1000).toFixed(1)}s on this node (${text.length} chars${cost})${ok ? '' : ' [agent failed]'}`)
+    if (!OWN_TRAFFIC_ONLY) log(`donated $${donatedUsd.toFixed(4)} of $${DONATED_BUDGET_USD.toFixed(2)} budget`)
+    if (!OWN_TRAFFIC_ONLY && donatedUsd >= DONATED_BUDGET_USD) {
+      log('donated budget reached; stopping before taking another job')
+      break
+    }
     if (stopAfterThis) break
   }
   log(`done, ${served} job(s) served`)
