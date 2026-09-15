@@ -951,6 +951,13 @@ t('SECURITY.md states the 90 day leaked-key limit', /90 day/.test(secDoc) && /re
 t('SECURITY.md states rate limiting is per instance and approximate', /per instance/i.test(secDoc) && /approximate/i.test(secDoc))
 t('SECURITY.md states the relay is plaintext trust', /plaintext trust/i.test(secDoc) && /reads the prompts/i.test(secDoc))
 t('SECURITY.md uses no em dashes', !secDoc.includes('—'))
+
+console.log('\nlicense — reuse terms are explicit')
+const license = readFileSync(new URL('../LICENSE', import.meta.url), 'utf8')
+t('the repository carries the standard MIT grant',
+  license.startsWith('MIT License\n') && /Permission is hereby granted, free of charge/.test(license))
+t('the license identifies the maintainer and year', /Copyright \(c\) 2026 Enes Yilmaz/.test(license))
+
 console.log('\nconfig — server-secret presence check gates a clean 503')
 const { hasSecrets } = await import('../lib/config.ts')
 t('hasSecrets is true when both secrets are set', hasSecrets('MASTER_SECRET', 'MASTER_ENCRYPTION_KEY'))
@@ -1264,6 +1271,12 @@ t('the pasted brief also verifies the node instead of trusting a pid',
     /read and accepted the supporter terms/i.test(quoted) && !/and follow it/i.test(quoted))
   t('the README no longer claims the supporter answers jobs in its own session',
     /headless `claude -p`/.test(readme))
+  t('the README includes an official Python client example',
+    /from openai import OpenAI/.test(readme) && /relaybee = OpenAI\(/.test(readme))
+  t('the Python example keeps both Relaybee credentials in environment variables',
+    /os\.environ\["RELAYBEE_KEY"\]/.test(readme)
+      && /os\.environ\["RELAYBEE_CONNECTIONS"\]/.test(readme)
+      && /default_headers=/.test(readme))
   // The README is the only description of the relay for anyone who never opens
   // the site, and it described one global queue. Both halves of the split have
   // to be there or it is selling the behaviour this branch removed.
