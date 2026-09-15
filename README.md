@@ -215,9 +215,10 @@ For a fuller tour of the design, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md
   polls with `{"pool":"public"}`. When both do, that supporter can read the prompts they answer and
   the caller can read their answer. The relay is a trust relationship there, and `/llms.txt` says
   so, which is the file a supporter's agent reads and follows before it runs anything.
-- The relay uses an in-memory queue unless Upstash is set, so on the free tier a caller and a
-  supporter only meet if they land on the same server. Set `UPSTASH_REDIS_REST_URL` and
-  `UPSTASH_REDIS_REST_TOKEN` to make it work everywhere.
+- Local development uses an in-memory queue unless Upstash is set. Serverless production requires
+  `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` and fails closed without both, because a
+  caller and a node may land on different edge instances. On another serverless host, set
+  `RELAYBEE_REQUIRE_DISTRIBUTED_QUEUE=1` to enforce the same deployment guard.
 - `/api/keys/issue` and `/api/work/*` answer same-origin callers only. They hand back a bearer
   key or a queued job, so they no longer reply to every origin with `*`. A front end on another
   domain needs its origin named in `RELAYBEE_ALLOWED_ORIGINS`, comma separated and matched

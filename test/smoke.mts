@@ -542,7 +542,21 @@ t('a node that never polled reads offline', before.connected === false)
 
 // A poll marks the node live before it even returns work. Give it a job to pop
 // so the long-poll returns immediately instead of holding the full window.
-const { submitJob } = await import('../lib/queue.ts')
+const { submitJob, queueBackendFor } = await import('../lib/queue.ts')
+console.log('\nqueue deployment mode — serverless never silently uses instance memory')
+t('local development can use the memory queue', queueBackendFor({}) === 'memory')
+t('both Upstash values select the distributed queue', queueBackendFor({
+  UPSTASH_REDIS_REST_URL: 'https://queue.example', UPSTASH_REDIS_REST_TOKEN: 'secret',
+}) === 'upstash')
+t('partial Upstash configuration fails closed', queueBackendFor({
+  UPSTASH_REDIS_REST_URL: 'https://queue.example',
+}) === 'unconfigured')
+t('Vercel production without Upstash fails closed', queueBackendFor({
+  VERCEL: '1', VERCEL_ENV: 'production',
+}) === 'unconfigured')
+t('other serverless hosts can require shared state', queueBackendFor({
+  RELAYBEE_REQUIRE_DISTRIBUTED_QUEUE: '1',
+}) === 'unconfigured')
 // Queued under the same user the polling key names, because a node only ever
 // sees its own queue now.
 await submitJob('claude-code', [{ role: 'user', content: 'warm' }], PRESENCE_USER)

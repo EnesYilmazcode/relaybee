@@ -104,8 +104,15 @@ caller against their own node, a `/public` caller against the opt-in count. One
 count for both could only say yes on the strength of some unrelated node, and
 hold a public caller for the whole streaming window on it.
 
-The queue is the only stateful piece in the system. It uses Upstash Redis when
-those environment variables are set, and a per-instance in-memory map otherwise.
+The queue is the only stateful piece in the system. It uses Upstash Redis in
+serverless production, and a per-instance in-memory map only in local development.
+Vercel production fails closed when either Upstash variable is absent; other
+serverless hosts can enforce the same guard with
+`RELAYBEE_REQUIRE_DISTRIBUTED_QUEUE=1`. This prevents a deployment from appearing
+healthy while callers and workers are isolated in different instances.
+Queue publication batches its `LPUSH`, cap and expiry into one REST pipeline;
+answer publication likewise batches its value and expiry. Redis still meters the
+individual commands, but each hot path pays for only one network round trip.
 Jobs carry only the model and the flattened messages, never the requester's id
 or IP: the identity is in the queue's name, which the node never sees.
 

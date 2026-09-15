@@ -1,5 +1,5 @@
 import { ADAPTERS } from '../lib/providers'
-import { QUEUE_DISTRIBUTED, countLive } from '../lib/queue'
+import { QUEUE_BACKEND, countLive } from '../lib/queue'
 import { check, clientIp } from '../lib/ratelimit'
 
 export const config = { runtime: 'edge' }
@@ -51,17 +51,18 @@ export default async function handler(req?: Request): Promise<Response> {
   if (req?.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS })
   return new Response(
     JSON.stringify({
-      ok: true,
+      ok: QUEUE_BACKEND !== 'unconfigured',
       // Which commit is deployed — short SHA from Vercel, or "dev" locally/under test.
       commit: process.env.VERCEL_GIT_COMMIT_SHA?.slice(0, 7) || 'dev',
       providers: Object.keys(ADAPTERS),
       // Which relay backing store is live, and how many supporters are polling.
-      queue: QUEUE_DISTRIBUTED ? 'upstash' : 'memory',
+      queue: QUEUE_BACKEND,
       supporters_online: await supportersOnline(req),
       // Presence check only — never echo the values.
       configured: {
         master_secret: Boolean(process.env.MASTER_SECRET),
         master_encryption_key: Boolean(process.env.MASTER_ENCRYPTION_KEY),
+        distributed_queue: QUEUE_BACKEND === 'upstash',
       },
     }),
     { headers: { 'content-type': 'application/json', 'cache-control': CACHE_CONTROL, ...CORS } },

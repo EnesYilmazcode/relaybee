@@ -29,7 +29,10 @@ console.log('\nupstash — the real REST path, not the memory fallback')
 t('the queue selected the Upstash store', queue.QUEUE_DISTRIBUTED === true)
 
 console.log('\nupstash — job round trip')
+fake.reset()
 const submitted = await queue.submitJob('claude-code', [{ role: 'user', content: 'hello upstash' }], OWNER)
+t('publishing a job batches three commands into one REST request',
+  fake.total() === 3 && fake.requests() === 1, `${fake.total()} commands in ${fake.requests()} request(s)`)
 const popped = await queue.nextJob(2000, OWNER)
 t('a submitted job comes back off the REST queue', popped?.id === submitted.id, popped?.id ?? 'none')
 t('the job carries its messages intact', popped?.messages[0]?.content === 'hello upstash')
@@ -94,6 +97,7 @@ t('a 3s wait costs one command, not six', fake.total() === 1, `${fake.total()} c
 fake.reset()
 await queue.completeJob('cost-check', 'x')
 t('publishing an answer costs two commands', fake.total() === 2, `${fake.total()}`)
+t('and batches them into one REST request', fake.requests() === 1, `${fake.requests()} request(s)`)
 
 console.log('\nupstash — presence')
 await queue.markLive('node-a')

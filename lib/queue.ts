@@ -3,10 +3,11 @@ import { bytesToB64u, enc } from './b64'
 // Work relay queue: users' chat requests go in, supporters' answers come out.
 //
 // Storage is Upstash Redis (REST) when UPSTASH_REDIS_REST_URL/TOKEN are set,
-// otherwise a per-instance in-memory fallback. The fallback lives on one warm
-// edge instance, so a user and a supporter only meet if they land on the same
-// instance. Good enough for a single-region demo and for tests; set Upstash to
-// make it real.
+// otherwise a per-instance in-memory fallback in local development. The
+// fallback lives on one warm edge instance, so a user and a supporter only meet
+// if they land on the same instance. A serverless production deployment fails
+// closed without Upstash instead of appearing healthy while losing jobs between
+// instances.
 
 export type Job = {
   id: string
@@ -127,24 +128,38 @@ async function brpopUntil<T>(cmd: Cmd, keys: string[], maxWaitMs: number, take: 
 }
 
 function upstashStore(url: string, token: string): Store {
+  const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
   const cmd = async (parts: Array<string | number>) => {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      headers,
       body: JSON.stringify(parts),
     })
     if (!res.ok) throw new Error(`queue backend error ${res.status}`)
     return ((await res.json()) as { result: unknown }).result
   }
+  const pipeline = async (commands: Array<Array<string | number>>): Promise<void> => {
+    const res = await fetch(`${url.replace(/\/$/, '')}/pipeline`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(commands),
+    })
+    if (!res.ok) throw new Error(`queue backend error ${res.status}`)
+    const replies = (await res.json()) as Array<{ error?: unknown }> | unknown
+    if (!Array.isArray(replies) || replies.length !== commands.length || replies.some((reply) => reply?.error)) {
+      throw new Error('queue backend returned an invalid pipeline response')
+    }
+  }
   return {
     push: async (queue, job) => {
-      await cmd(['LPUSH', queue, JSON.stringify(job)])
-      // Keep only the newest MAX_QUEUE (LPUSH prepends, BRPOP drains the tail).
-      await cmd(['LTRIM', queue, 0, MAX_QUEUE - 1])
-      // Without this a queue for a user who never runs a node lives forever.
-      // Jobs already expire by age on the way out; this stops the key itself
-      // accumulating, one command on a path that already costs two.
-      await cmd(['EXPIRE', queue, Math.ceil(JOB_MAX_AGE_MS / 1000) * 2])
+      // These remain three metered Redis commands, but one REST round trip. They
+      // are ordered inside the pipeline: append, cap, then attach the expiry.
+      await pipeline([
+        ['LPUSH', queue, JSON.stringify(job)],
+        ['LTRIM', queue, 0, MAX_QUEUE - 1],
+        // Without this a queue for a user who never runs a node lives forever.
+        ['EXPIRE', queue, Math.ceil(JOB_MAX_AGE_MS / 1000) * 2],
+      ])
     },
     // The value is byte-identical to what push serialised, since it is the same
     // object. If a supporter popped it a moment ago this removes nothing, which
@@ -167,8 +182,11 @@ function upstashStore(url: string, token: string): Store {
     // The answer is a one-element list rather than a plain string so the waiting
     // caller can BRPOP it instead of polling GET twice a second.
     setResult: async (id, result) => {
-      await cmd(['LPUSH', `relaybee:result:${id}`, JSON.stringify(result)])
-      await cmd(['EXPIRE', `relaybee:result:${id}`, RESULT_TTL_S])
+      const key = `relaybee:result:${id}`
+      await pipeline([
+        ['LPUSH', key, JSON.stringify(result)],
+        ['EXPIRE', key, RESULT_TTL_S],
+      ])
     },
     // The same blocking read on the other side of the relay: one command per 15s
     // of waiting instead of two GETs a second. That is what makes a long wait
@@ -303,6 +321,42 @@ function memoryStore(): Store {
   }
 }
 
+export type QueueBackend = 'upstash' | 'memory' | 'unconfigured'
+
+/**
+ * Choose the queue deliberately. Local development keeps the zero-setup memory
+ * store, but an edge deployment must have shared state: two requests are free
+ * to land on different isolates. Partial Upstash configuration is always an
+ * error so a mistyped secret cannot silently downgrade production.
+ */
+export function queueBackendFor(env: Record<string, string | undefined>): QueueBackend {
+  const hasUrl = Boolean(env.UPSTASH_REDIS_REST_URL)
+  const hasToken = Boolean(env.UPSTASH_REDIS_REST_TOKEN)
+  if (hasUrl && hasToken) return 'upstash'
+  if (hasUrl || hasToken) return 'unconfigured'
+  if (env.VERCEL === '1' || env.VERCEL_ENV === 'production' || env.RELAYBEE_REQUIRE_DISTRIBUTED_QUEUE === '1') {
+    return 'unconfigured'
+  }
+  return 'memory'
+}
+
+function unconfiguredStore(): Store {
+  const fail = async (): Promise<never> => {
+    throw new Error('A distributed queue is required in production; configure both Upstash Redis REST variables')
+  }
+  return {
+    push: fail,
+    remove: fail,
+    waitPop: fail,
+    setResult: fail,
+    waitResult: fail,
+    markPresence: fail,
+    isPresent: fail,
+    countPresent: fail,
+    countPresentPublic: fail,
+  }
+}
+
 // One imported key per process, same shape as lib/auth.ts. Keyed by the secret
 // so a rotated MASTER_SECRET is picked up rather than served from a warm cache.
 let ticketKey: { secret: string; key: CryptoKey } | null = null
@@ -324,8 +378,13 @@ async function signTicket(jobId: string, supporter: string): Promise<string> {
 
 const url = process.env.UPSTASH_REDIS_REST_URL
 const token = process.env.UPSTASH_REDIS_REST_TOKEN
-export const QUEUE_DISTRIBUTED = Boolean(url && token)
-const store: Store = QUEUE_DISTRIBUTED ? upstashStore(url!, token!) : memoryStore()
+export const QUEUE_BACKEND = queueBackendFor(process.env)
+export const QUEUE_DISTRIBUTED = QUEUE_BACKEND === 'upstash'
+const store: Store = QUEUE_BACKEND === 'upstash'
+  ? upstashStore(url!, token!)
+  : QUEUE_BACKEND === 'memory'
+    ? memoryStore()
+    : unconfiguredStore()
 
 /**
  * Queue a job for whoever can serve it.
