@@ -5,7 +5,7 @@ stale relative to the code. Newest entries at the top of each log.
 
 **Status:** deployed, and the relay is verified end to end on production rather than only in local
 tests. The serverless queue and incremental donated-API round landed as #117. The MIT license and
-Python client documentation follow-up is in review on `docs/resolve-110-111`. The relay's direction
+Python client documentation follow-up is in review as #118. The relay's direction
 is decided (see the #76 section below:
 the public pool stays, opt-in and empty by default). **One thing still wants a
 decision: whether to rotate `MASTER_SECRET` over the key leaked in `test_ascii_art.py`.** That
@@ -22,7 +22,7 @@ existence.
 
 | Item | Branch / PR |
 |---|---|
-| Add an MIT license and an official Python client example, resolving #110 and #111 | `docs/resolve-110-111` |
+| Add an MIT license and an official Python client example, resolving #110 and #111 | `docs/resolve-110-111` ([#118](https://github.com/EnesYilmazcode/relaybee/pull/118)) |
 
 ### Shipped
 
