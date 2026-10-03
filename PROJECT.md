@@ -12,7 +12,7 @@ decision: whether to rotate `MASTER_SECRET` over the key leaked in `test_ascii_a
 key is valid until 2026-10-31 and rotation is the only lever, which invalidates every key in
 existence.
 **Live URL:** https://relaybee.vercel.app
-**Last updated:** 2026-09-15
+**Last updated:** 2026-10-03
 
 ---
 
@@ -549,6 +549,22 @@ Honest list. None of these are bugs; all are consequences of choices above.
 ---
 
 ## Changelog
+
+### 2026-10-03 (the connect line asked for an API key to answer your own calls)
+
+The hosted setup script in `llms.txt` and the pasted brief both demanded `ANTHROPIC_API_KEY` and
+passed `--bare` on every node, including one that only answers its own queue. That is the one
+case the billing rule does not cover: both ends are the same person, on their own seat. So the
+owner pasted the connect line and was told to go buy API credit, on the path whose whole point is
+turning a subscription into a single API call. `scripts/supporter.mjs --own-traffic-only` already
+did the right thing; nothing the site hands out did.
+
+Now `POOL` decides. An own-queue node (the default) answers on the Claude login with no key. A node
+opted into the public pool still gets `--bare` and still refuses to start without
+`ANTHROPIC_API_KEY`, so a consumer seat cannot answer strangers by accident. Containment is
+unchanged: `--safe-mode`, `--strict-mcp-config`, the deny list, the canary and the timeout apply
+to both. Verified by running the own-queue command with `ANTHROPIC_API_KEY` unset: it answered on
+the login. Not yet rerun through `test/agent-harness.mts`.
 
 ### 2026-09-13 (malformed provider messages fail at the request boundary)
 
