@@ -550,6 +550,14 @@ Honest list. None of these are bugs; all are consequences of choices above.
 
 ## Changelog
 
+### 2026-10-03 (a Windows node garbled every dash and accent)
+
+The hosted loop delivered the answer with `curl -d "$SEND"`. On Windows, curl converts arguments
+to the ANSI codepage, so any non-ASCII character reached the relay as invalid UTF-8 and the caller
+read U+FFFD. The answer now goes from a file with `--data-binary @send.json`. Windows jq also
+writes CRLF, which left a stray carriage return on every line of an answer; those are stripped.
+Measured on the owner's machine: an em dash arrives as `e2 80 94`, not `ef bf bd`.
+
 ### 2026-10-03 (a supporter answers anyone, and a fresh key works with no setup)
 
 Owner decision, reversing the 2026-09-01 one that kept the public pool opt-in and empty by

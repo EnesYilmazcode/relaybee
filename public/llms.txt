@@ -225,7 +225,7 @@ improvising a port.
         # .result is the answer and the rest is the accounting. A build that does
         # not emit the envelope still answers, so treat its plain output as the
         # answer and deliver that without numbers rather than lose the job.
-        if ANSWER=$(printf '%s' "$RAW" | jq -er '.result' 2>/dev/null); then
+        if ANSWER=$(set -o pipefail; printf '%s' "$RAW" | jq -er '.result' 2>/dev/null | tr -d ''); then
           USAGE=$(printf '%s' "$RAW" | jq -c 'if .usage then {input_tokens: ((.usage.input_tokens // 0) + (.usage.cache_read_input_tokens // 0) + (.usage.cache_creation_input_tokens // 0)), output_tokens: (.usage.output_tokens // 0), cost_usd: (.total_cost_usd // 0)} else empty end')
         else
           ANSWER=$RAW
@@ -243,8 +243,11 @@ improvising a port.
         else
           SEND=$(jq -n --arg id "$ID" --arg ticket "$TICKET" --arg text "$ANSWER" '{id:$id,ticket:$ticket,text:$text}')
         fi
+        # From a file, not an argument: on Windows curl converts arguments to the
+        # ANSI codepage, which turned every dash and accent in an answer into U+FFFD.
+        printf '%s' "$SEND" > send.json
         curl -sS -X POST $BASE/api/work/complete -H "Authorization: Bearer $KEY" \
-          -H 'content-type: application/json' -d "$SEND" >/dev/null
+          -H 'content-type: application/json' --data-binary @send.json >/dev/null
         echo "answered $ID at $(date)"
         DONE=$((DONE + 1))
         if [ "$DONE" -ge "$MAXJOBS" ]; then
