@@ -1055,13 +1055,14 @@ t('the total spend is bounded, not just the per-job spend',
 // refuses to start if the answering process can read it back.
 t('the worker proves its containment before it takes any job',
   /RELAYBEE-CANARY-MUST-NOT-ESCAPE/.test(llms) && /REFUSING TO START/.test(llms))
-// --bare reads ANTHROPIC_API_KEY and never the OAuth login or keychain, so a
-// supporter node cannot bill a consumer Pro/Max seat even by accident. This is
-// what answers the one objection real agents kept raising, "is this a consumer
-// plan or API-billed", by construction rather than by wording. Verified:
-// --bare with no key exits on "Not logged in, please run /login".
-t('answering runs on API billing rather than the human seat',
-  /--bare/.test(llms) && /ANTHROPIC_API_KEY/.test(llms))
+// Own jobs answer on the human's own login, which is the point of the project.
+// A public-pool node adds --bare, which reads ANTHROPIC_API_KEY and never the
+// OAuth login or keychain, so it cannot bill a consumer Pro/Max seat even by
+// accident. Verified: --bare with no key exits on "Not logged in, please run /login".
+t('own jobs answer on the human seat with no API key demanded',
+  /claude -p \$BILLING \$SAFE/.test(llms) && /\n\s+BILLING=\r?\n/.test(llms))
+t('a public-pool node runs on API billing rather than the human seat',
+  /if \[ "\$POOL" = public \]; then\s+\[ -n "\$ANTHROPIC_API_KEY" \][\s\S]*?BILLING=--bare/.test(llms))
 t('the worker answers from a throwaway directory rather than wherever it started',
   /mktemp -d/.test(llms))
 t('the worker script records a pid so the stop instruction works', /relaybee_worker\.pid/.test(llms))
@@ -1195,18 +1196,18 @@ t('the pasted brief also verifies the node instead of trusting a pid',
   t('the brief renders with the origin and the key substituted in',
     brief.includes('https://relaybee.test/api/work/next') && brief.includes('rb_live_smoke.key'), `len=${brief.length}`)
   t('the brief names the four containment mechanisms llms.txt relies on',
-    ['--bare', '--safe-mode', '--strict-mcp-config'].every((f) => brief.includes(f)) && /timeout 120 claude/.test(brief))
-  // --bare reads ANTHROPIC_API_KEY and nothing else, which is what makes the
-  // licensing answer structural. The brief has to say so, or an agent starts a
-  // node on whatever login the machine happens to be carrying.
-  t('and stops rather than billing whatever login the machine has', /ANTHROPIC_API_KEY/.test(brief))
+    ['--safe-mode', '--strict-mcp-config'].every((f) => brief.includes(f)) && /timeout 120 claude/.test(brief))
+  // The brief only ever polls its own queue, so it answers on the human's own
+  // login. What it must never do is carry that seat into the public pool.
+  t('and answers own calls on the login without wandering into the public pool',
+    !/SAFE="--bare/.test(brief) && /Never point it at the public pool/.test(brief))
   t('and bounds the total spend, not only the per-job spend',
     /--max-budget-usd/.test(brief) && /Stop after 100 jobs/.test(brief))
 
   const briefFlags = flagsOf(brief)
   const hostedFlags = flagsOf(llms)
   t('the two supporter paths pass the same containment flags',
-    hostedFlags.size >= 4 && briefFlags.size === hostedFlags.size && [...hostedFlags].every((f) => briefFlags.has(f)),
+    hostedFlags.size >= 3 && briefFlags.size === hostedFlags.size && [...hostedFlags].every((f) => briefFlags.has(f)),
     `brief: ${[...briefFlags].join(' ')} | hosted: ${[...hostedFlags].join(' ')}`)
   const briefDeny = denyOf(brief)
   const hostedDeny = denyOf(llms)
@@ -1288,7 +1289,7 @@ t('the pasted brief also verifies the node instead of trusting a pid',
   // the shipped script actually passes, and hold the README to it in both
   // directions - every flag present, and the number it claims equal to the
   // number it lists.
-  const containment = [...new Set((/SAFE="([^"]+)"/.exec(llms)?.[1] ?? '').trim().split(/\s+/).filter(Boolean)), '--disallowedTools', 'timeout 120']
+  const containment = [...new Set((/SAFE="([^"]+)"/.exec(llms)?.[1] ?? '').trim().split(/\s+/).filter(Boolean)), '--bare', '--disallowedTools', 'timeout 120']
   const absent = containment.filter((f) => !readme.includes(f))
   t('the README lists every flag the shipped worker is contained by',
     containment.length >= 6 && absent.length === 0, absent.join(', ') || `${containment.length} flags`)

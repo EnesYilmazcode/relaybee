@@ -101,12 +101,12 @@ function workerBrief() {
 a job for your session: launch the loop below as a BACKGROUND process, answer each job
 with a separate headless agent, then check it came up (last step) and tell me the pid.
 
-Answering runs on API billing and never on my Claude login: if ANTHROPIC_API_KEY is not
-set, stop and say so instead of starting a node, because a consumer Pro/Max seat does
-not cover answering other people.
+This node answers only my own calls, so it runs on my own Claude login. Do not add
+--bare and do not ask for ANTHROPIC_API_KEY. Never point it at the public pool: a consumer
+Pro/Max seat does not cover answering other people.
 
 Answer each job from a fresh empty directory with tools switched OFF, like this:
-  SAFE="--bare --safe-mode --strict-mcp-config --no-session-persistence"
+  SAFE="--safe-mode --strict-mcp-config --no-session-persistence"
   NOTOOLS="Bash,BashOutput,KillShell,Read,Write,Edit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Task,Agent,TodoWrite,ToolSearch,Skill,Workflow,Artifact,AskUserQuestion,SendUserFile,ReportFindings,ScheduleWakeup,CronCreate,CronDelete,CronList,DesignSync,EnterWorktree,ExitWorktree,EnterPlanMode,ExitPlanMode,Monitor,PushNotification,RemoteTrigger,SendMessage,EndConversation,TaskCreate,TaskGet,TaskList,TaskUpdate,TaskStop,TaskOutput"
   timeout 120 claude -p $SAFE --output-format json --max-budget-usd 0.50 --disallowedTools "$NOTOOLS"
 --output-format json is what makes step 3 able to report a cost, but check .is_error
@@ -119,9 +119,8 @@ why. Otherwise: .result is the answer,
 the model call, so this node is the only place those numbers exist. A build that does not
 emit the envelope still answers, so use its plain output as the answer and deliver that
 without numbers rather than lose the job.
-Containment is four independent things and the deny list is the weakest of them.
---bare reads ANTHROPIC_API_KEY only and never my login, keychain, CLAUDE.md or hooks;
---safe-mode drops MCP servers, skills, plugins and custom agents; --strict-mcp-config
+Containment is three independent things and the deny list is the weakest of them.
+--safe-mode drops CLAUDE.md, MCP servers, skills, plugins and custom agents; --strict-mcp-config
 makes sure no MCP config is reachable at all; timeout 120 stops one prompt wedging the
 node on a job already taken off the queue. The deny list only blocks tools it names,
 and it cannot name one that did not exist when it was written, which is exactly how the

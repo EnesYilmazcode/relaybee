@@ -98,10 +98,12 @@ Codex:
 > https://relaybee.vercel.app/llms.txt. I have read and accepted the supporter terms on that page.
 > Run the setup, then tell me the pid and the stop command.
 
-It needs `ANTHROPIC_API_KEY` exported first. That is not incidental. Supporter nodes answer on API
-billing and never on your Claude login, because a consumer seat is licensed to its holder for their
-own use and answering strangers is the part it does not cover. `--bare` reads the API key and never
-touches OAuth or the keychain, so a node cannot spend a Pro/Max seat even by accident. Cost is bounded at both ends: `--max-budget-usd` caps a single job, and the loop stops itself after
+By default the node answers only your own calls, on your own Claude login, with no API key. That is
+the point: a subscription turned into a single API call. A node opted into the public pool
+(`RELAYBEE_POOL=public`) is different and needs `ANTHROPIC_API_KEY` exported first, because a
+consumer seat is licensed to its holder for their own use and answering strangers is the part it
+does not cover. There the loop adds `--bare`, which reads the API key and never touches OAuth or the
+keychain, so a public node cannot spend a Pro/Max seat even by accident. Cost is bounded at both ends: `--max-budget-usd` caps a single job, and the loop stops itself after
 `MAXJOBS` jobs (100 by default, set `RELAYBEE_MAX_JOBS` to change it) so the total is finite too.
 
 For the lower-overhead, incrementally streamed worker included in this repository, run:
@@ -161,7 +163,7 @@ flowchart LR
 
   subgraph G ["claude -p, in a fresh mktemp -d"]
     direction TB
-    B1["--bare<br/>API key only. No CLAUDE.md,<br/>hooks, plugins or keychain"]
+    B1["--bare, public pool only<br/>API key only. No hooks<br/>or keychain"]
     B2["--safe-mode<br/>No MCP servers, skills,<br/>plugins or custom agents"]
     B3["--strict-mcp-config<br/>No MCP config reachable"]
     B4["--no-session-persistence<br/>Nothing about the job is<br/>written down or resumable"]
