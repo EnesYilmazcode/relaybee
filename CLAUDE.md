@@ -62,6 +62,13 @@ path through the API and is documented on the docs page; it just has no UI.
   Run it before changing the connect line in `app.js` or the wording of `llms.txt` — both are
   load-bearing and the obvious phrasing measurably does not work. An agent's fetch tool caches,
   so use a fresh port per batch or you are measuring the previous edit.
+- **`npm run test:onboard` is the real thing, and it is the check to run after any change to
+  `llms.txt`, `app.js` or the relay.** It takes the connect line off the live homepage, hands it to
+  a fresh headless Claude Code, waits for the relay to see the node, then calls it with the node's
+  own key, with a key minted from the public endpoint, and from a Python file run as its own
+  process. Nothing is mocked and it runs against production (or `--base <preview url>`), so it
+  spends real usage on this machine's Claude login: about a minute of setup and four short
+  answers. `--reuse` skips the setup and tests the node already running.
 - `npm run coverage` runs the whole gate under c8 and prints what never executed. Use it before
   claiming anything is dead: grep answers "nothing references this name", which is a different
   question from "this never runs". Measured 2026-08-20: **95.9% of statements, 99.2% of functions**,
