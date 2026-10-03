@@ -550,6 +550,22 @@ Honest list. None of these are bugs; all are consequences of choices above.
 
 ## Changelog
 
+### 2026-10-03 (a supporter answers anyone, and a fresh key works with no setup)
+
+Owner decision, reversing the 2026-09-01 one that kept the public pool opt-in and empty by
+default. The owner minted a key on the homepage, had a node online, and was told "1 supporter
+online, but it is not yours". Three keys in three places (homepage, node, client) and none of them
+could reach the one node that was running. His words: the point of a supporter is to support
+anyone using it.
+
+- `claude-code` from a caller with no live node of their own now falls back to the shared pool.
+  An own node still wins when there is one. The fallback is metered by the public-pool limit
+  (4 a minute per key and per source), which is the only brake on a supporter's seat.
+- The hosted script's default is `RELAYBEE_POOL=public`; `own` is the opt-out. It answers on the
+  Claude login unless `ANTHROPIC_API_KEY` is exported, in which case it adds `--bare`. The
+  licensing note stays in `llms.txt` as one sentence.
+- Homepage and docs stop sending people to `claude-code/public`, which still works.
+
 ### 2026-10-03 (the connect line asked for an API key to answer your own calls)
 
 The hosted setup script in `llms.txt` and the pasted brief both demanded `ANTHROPIC_API_KEY` and

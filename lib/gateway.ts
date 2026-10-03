@@ -178,7 +178,12 @@ function flatten(content: unknown): string {
 }
 
 async function relayCompletion(req: Request, body: ChatRequest, owner: string, headers: Record<string, string>): Promise<Response> {
-  const pool = poolFor(body.model)
+  let pool = poolFor(body.model)
+  // A caller with no node of their own is served by whoever is supporting. That
+  // is what a supporter is for, and it means a fresh key works with no setup.
+  // An own node still wins when there is one, so nothing private moves pools.
+  const fellBack = pool === 'own' && !(await isLive(owner).catch(() => false))
+  if (fellBack) pool = 'public'
   // A public-pool job is answered on a volunteer's own API key, so it spends a
   // budget the caller does not hold and Relaybee cannot see. The general limit
   // is the wrong instrument for that: it exists to protect this service's
@@ -224,7 +229,7 @@ async function relayCompletion(req: Request, body: ChatRequest, owner: string, h
   const created = Math.floor(Date.now() / 1000)
   const relayHeaders = { ...headers, 'x-relaybee-provider': RELAY_PROVIDER }
 
-  if (body.stream) return relayStream(job, body, owner, pool, created, relayHeaders)
+  if (body.stream) return relayStream(job, body, owner, pool, created, relayHeaders, fellBack)
 
   let result: Awaited<ReturnType<typeof awaitResult>>
   try {
@@ -239,7 +244,7 @@ async function relayCompletion(req: Request, body: ChatRequest, owner: string, h
     // Nobody is waiting for this any more. Leaving it queued means the next
     // supporter to connect spends real model time on an answer no one reads.
     await cancelJob(job, owner, pool).catch(() => {})
-    return err(504, await timedOutMessage(owner, pool), 'api_error', headers)
+    return err(504, await timedOutMessage(owner, pool, undefined, fellBack), 'api_error', headers)
   }
 
   return new Response(
@@ -258,10 +263,13 @@ async function relayCompletion(req: Request, body: ChatRequest, owner: string, h
  * caller to retry while a supporter is mid answer just queues the same prompt
  * twice and spends their tokens twice.
  */
-async function timedOutMessage(owner: string, pool: Pool, known?: Serving): Promise<string> {
+async function timedOutMessage(owner: string, pool: Pool, known?: Serving, fellBack = false): Promise<string> {
   const serving = known ?? (await anyoneCanServe(owner, pool))
   if (serving === 'yes') {
     return `A supporter took this and did not finish inside ${RELAY_WAIT_MS / 1000}s. Send "stream": true and Relaybee holds the connection open while they work, which is what long answers need.`
+  }
+  if (fellBack) {
+    return `No supporter is online right now. "${RELAY_PROVIDER}" is answered by a node of your own, or by any supporter when you have none, so start one.`
   }
   return pool === 'public'
     ? 'No node is watching the public pool right now. Run one yourself, or drop the "/public" suffix to use your own.'
@@ -296,7 +304,7 @@ async function anyoneCanServe(owner: string, pool: Pool): Promise<Serving> {
  * wait in slices, sending an SSE comment between them so nothing along the path
  * decides the connection is idle.
  */
-function relayStream(job: Job, body: ChatRequest, owner: string, pool: Pool, created: number, relayHeaders: Record<string, string>): Response {
+function relayStream(job: Job, body: ChatRequest, owner: string, pool: Pool, created: number, relayHeaders: Record<string, string>, fellBack = false): Response {
   const includeUsage = (body.stream_options as { include_usage?: unknown } | undefined)?.include_usage === true
   const encoder = new TextEncoder()
   const frame = (o: unknown) => `data: ${JSON.stringify(o)}\n\n`
@@ -365,7 +373,7 @@ function relayStream(job: Job, body: ChatRequest, owner: string, pool: Pool, cre
 
       if (!finished) {
         await cancelJob(job, owner, pool).catch(() => {})
-        send(frame({ error: { message: streamError ?? await timedOutMessage(owner, pool, online), type: 'api_error' } }))
+        send(frame({ error: { message: streamError ?? await timedOutMessage(owner, pool, online, fellBack), type: 'api_error' } }))
       } else {
         send(frame(chunk({}, 'stop')))
         // OpenAI convention, and the same one the provider path already follows:

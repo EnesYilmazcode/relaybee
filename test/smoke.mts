@@ -718,6 +718,9 @@ console.log('\npublic pool — repeated submissions are throttled on one warm in
   // it. The node earns its keep twice: with nobody answering, this call holds the
   // relay's 20s window open, which is 20s on every run of the gate.
   const capSupporter = await issueKey(capUser)
+  // The node has to be live before the call: with none, the call is served by
+  // the shared pool, which is the thing this caller has just exhausted.
+  await (await import('../lib/queue.ts')).markLive(capUser)
   const ownReq = chatCompletions(new Request('https://x/api/v1/chat/completions', {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${capKey}` },
@@ -1061,8 +1064,10 @@ t('the worker proves its containment before it takes any job',
 // accident. Verified: --bare with no key exits on "Not logged in, please run /login".
 t('own jobs answer on the human seat with no API key demanded',
   /claude -p \$BILLING \$SAFE/.test(llms) && /\n\s+BILLING=\r?\n/.test(llms))
-t('a public-pool node runs on API billing rather than the human seat',
-  /if \[ "\$POOL" = public \]; then\s+\[ -n "\$ANTHROPIC_API_KEY" \][\s\S]*?BILLING=--bare/.test(llms))
+t('a machine with an API key answers on API billing rather than the human seat',
+  /\[ -n "\$ANTHROPIC_API_KEY" \] && BILLING=--bare/.test(llms))
+t('a node serves anyone by default, and own-only is the opt-out',
+  /POOL=\$\{RELAYBEE_POOL:-public\}/.test(llms) && /RELAYBEE_POOL=own/.test(llms))
 t('the worker answers from a throwaway directory rather than wherever it started',
   /mktemp -d/.test(llms))
 t('the worker script records a pid so the stop instruction works', /relaybee_worker\.pid/.test(llms))
@@ -1241,7 +1246,7 @@ t('the pasted brief also verifies the node instead of trusting a pid',
   renderStatus({ connected: false, online: 3 })
   const notMine = cells['use-text'].textContent
   t('nodes online that are none of yours do not read as an answerable claude-code',
-    cells['use-status'].live === false && /none of them is yours/i.test(notMine) && /claude-code\/public/.test(notMine), notMine)
+    cells['use-status'].live === false && /supporters online\. claude-code will be answered/i.test(notMine), notMine)
   t('while the support view still leads with the global count on the same poll',
     cells['status'].live === true && cells['status-text'].textContent === '3 supporters online', cells['status-text'].textContent)
 
@@ -1259,7 +1264,7 @@ t('the pasted brief also verifies the node instead of trusting a pid',
 
   renderStatus({ connected: false, online: 1 })
   t('the single-node wording reads as English',
-    /1 supporter online, but it is not yours/.test(cells['use-text'].textContent), cells['use-text'].textContent)
+    /1 supporter online\. claude-code will be answered/.test(cells['use-text'].textContent), cells['use-text'].textContent)
 }
 // The README quotes this line for people who never open the site. Drift there
 // hands them the phrasing that was measured to fail.
@@ -1614,22 +1619,22 @@ console.log('%srelay timeout copy - the message names the real problem', String.
   const lonely = await issueKey('lonely_caller')
   const lonelyRes = chatCompletions(new Request('https://x/api/v1/chat/completions', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${lonely}` },
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${lonely}`, 'x-forwarded-for': '198.51.100.211' },
     body: JSON.stringify({ model: 'claude-code', messages: [{ role: 'user', content: 'anyone?' }] }),
   }))
   await (await import('../lib/queue.ts')).markLive('own_only_bystander')
   const stranded = await issueKey('stranded_public_caller')
   const strandedRes = chatCompletions(new Request('https://x/api/v1/chat/completions', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${stranded}` },
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${stranded}`, 'x-forwarded-for': '198.51.100.212' },
     body: JSON.stringify({ model: 'claude-code/public', messages: [{ role: 'user', content: 'anyone at all?' }] }),
   }))
 
   const res = await lonelyRes
   const body = await res.json()
-  t('a caller with no node of their own is told exactly that',
-    res.status === 504 && /no node of your own/i.test(body.error.message), body.error.message.slice(0, 60))
-  t('and is pointed at the public pool as the alternative', /claude-code[/]public/.test(body.error.message))
+  t('a caller with no node and no supporter online is told exactly that',
+    res.status === 504 && /no supporter is online/i.test(body.error.message), body.error.message.slice(0, 60))
+  t('and is told to start one', /start one/.test(body.error.message))
 
   // The public pool cannot be answered out of a global count. Presence says
   // somebody is polling; it does not say any of them is watching the shared

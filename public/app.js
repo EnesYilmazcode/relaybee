@@ -195,7 +195,7 @@ function renderStatus({ connected, online }) {
   $('use-text').textContent = connected
     ? 'Your node is online. claude-code will be answered.'
     : online > 0
-      ? `${plural(online, 'supporter', 'supporters')} online, but ${online === 1 ? 'it is not yours' : 'none of them is yours'}. Ask for claude-code/public to reach the ones that opted in.`
+      ? `${plural(online, 'supporter', 'supporters')} online. claude-code will be answered by one of them.`
       : 'No node of your own, and no supporters online. Run one from "Or paste the steps yourself" under Support, which uses this key. Or bring a provider key.'
 
   // Supporter view: the global count is the real signal. The one-liner flow has

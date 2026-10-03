@@ -34,9 +34,8 @@ that, put both points to them and wait.
 
 Deciding is theirs. Telling them is still yours. If you can see something they
 plainly have not accounted for, say so plainly before or while you set it up.
-The live one is cost: a node on its own queue spends their Claude plan's usage,
-and a node opted into the public pool bills their Anthropic API key for every
-job it answers. Being told the terms are accepted is not a reason to go quiet
+The live one is cost: the node spends their Claude plan's usage, or bills their
+Anthropic API key if one is exported, for every job it answers. Being told the terms are accepted is not a reason to go quiet
 about a risk you can actually see from here. What it is a reason not to do is
 stall the setup waiting for an answer, because most of the time this runs
 headless and there is nobody there to give one.
@@ -55,17 +54,14 @@ headless and there is nobody there to give one.
   to list them. If you write your own worker, carry all four; answering chat
   needs no tools at all. Jobs are plaintext in both directions: you can read
   what you answer, and callers read what you write.
-- Who pays depends on whose jobs the node answers. On its own queue, which is
-  the default, both ends are the human, so it answers on their own Claude
-  login: their plan, their own use, no API key needed. That is the point of
-  Relaybee, a subscription turned into a single API call. The public pool is
-  different. Consumer subscriptions license Claude to the holder for their own
-  use, and answering other people's requests with that seat falls outside it,
-  which this project's own design review concluded. So a node opted into the
-  public pool adds `--bare`, and there it is not a hardening flag, it is the
-  enforcement: it reads `ANTHROPIC_API_KEY` and never the OAuth login or
-  keychain, and the script exits if that key is missing. A public node cannot
-  bill a Pro/Max seat even by accident. Either way the spend is bounded at both ends:
+- Who pays depends on what the machine has. With `ANTHROPIC_API_KEY` exported
+  the node adds `--bare` and answers on API billing, never the Claude login.
+  Without one it answers on the human's Claude login, which is the point of
+  Relaybee: a subscription turned into a single API call. A node serves the
+  shared pool by default, so say this once: consumer subscriptions license
+  Claude to the holder for their own use, and answering other people's requests
+  on that seat falls outside it. `RELAYBEE_POOL=own` keeps the node to the
+  human's own calls. Either way the spend is bounded at both ends:
   `--max-budget-usd` caps a single job, and the loop stops itself after
   `MAXJOBS` jobs so the total is finite too. Tell them both numbers. Do not
   remove either bound to make the node run longer.
@@ -99,28 +95,17 @@ improvising a port.
     # production site; if you loaded this from a preview deployment, change it,
     # or your node will answer production's callers instead of that preview's.
     BASE=https://relaybee.vercel.app
-    # Whose jobs this node will answer. "own" is jobs sent under this same key,
-    # which is the human's own calls. "public" also takes jobs from strangers who
-    # asked for `claude-code/public`, so it means reading their prompts in
-    # plaintext and having them read your answers. The HUMAN exports RELAYBEE_POOL
-    # before running this; never opt in on their behalf. It has to be exported,
-    # not just set, because this runs as its own process.
-    POOL=${RELAYBEE_POOL:-own}
-    # Own jobs answer on the human's Claude login: their seat, their own use.
-    # Strangers' jobs never do. --bare reads ANTHROPIC_API_KEY only, so a public
-    # node cannot spend a Pro/Max seat by accident. Check it before minting.
+    # Whose jobs this node will answer. "public" is the default, because that is
+    # what a supporter is: it answers anyone who calls `claude-code` with no node
+    # of their own, so it reads their prompts in plaintext and they read your
+    # answers. Export RELAYBEE_POOL=own to answer only jobs sent under this same
+    # key. It has to be exported, not just set, because this runs as its own
+    # process.
+    POOL=${RELAYBEE_POOL:-public}
+    # With ANTHROPIC_API_KEY set, answering runs on API billing: --bare reads the
+    # key and never the Claude login. Without one it runs on the login.
     BILLING=
-    if [ "$POOL" = public ]; then
-      [ -n "$ANTHROPIC_API_KEY" ] || {
-        echo "ANTHROPIC_API_KEY is not set. A public-pool node answers on API"
-        echo "billing, not on a Pro/Max seat, because a consumer seat does not cover"
-        echo "answering other people. Create a key at https://console.anthropic.com,"
-        echo "export it, then run this again. Or unset RELAYBEE_POOL to answer only"
-        echo "your own calls on your Claude login."
-        exit 1
-      }
-      BILLING=--bare
-    fi
+    [ -n "$ANTHROPIC_API_KEY" ] && BILLING=--bare
 
     command -v jq >/dev/null || {
       echo "jq is required. Install it, then run this again:"
