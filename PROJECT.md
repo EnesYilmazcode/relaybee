@@ -550,6 +550,16 @@ Honest list. None of these are bugs; all are consequences of choices above.
 
 ## Changelog
 
+### 2026-10-03 (the onboarding path has a real end to end test)
+
+`test/onboard-e2e.mjs`, run as `npm run test:onboard`. Every failure this week was on the path a
+supporter actually takes (a fresh Claude Code, the pasted line, the script it writes from
+`llms.txt`), and nothing ran that path: `live-e2e.mts` starts `scripts/supporter.mjs` directly.
+This one pastes the homepage's own line into a fresh headless Claude Code and trusts only the
+relay's status endpoint for whether a node came up. First run against production: setup in 48s,
+then the node's own key, a never-seen key, a non-ASCII round trip and a standalone Python file all
+answered in 3 to 4 seconds each. 10 of 10 steps passed.
+
 ### 2026-10-03 (a Windows node garbled every dash and accent)
 
 The hosted loop delivered the answer with `curl -d "$SEND"`. On Windows, curl converts arguments

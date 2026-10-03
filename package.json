@@ -11,6 +11,7 @@
     "test:e2e": "tsx test/e2e.mts",
     "check": "npm run typecheck && npm test && npm run test:upstash && npm run test:e2e && npm run test:adversary",
     "test:live": "tsx test/live-e2e.mts",
+    "test:onboard": "node test/onboard-e2e.mjs",
     "test:adversary": "tsx test/adversary.mts",
     "coverage": "c8 --reporter=text --src=lib --src=api --include=lib/** --include=api/** --all --clean=false npm run check"
   },
