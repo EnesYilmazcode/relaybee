@@ -161,11 +161,11 @@ function renderStatus(n, mine) {
   $('status-text').textContent = mine
     ? 'A node of your own is online, so claude-code is answered on your machine'
     : n > 0
-      ? `No node of your own, so claude-code has nobody. ${n} node${n === 1 ? '' : 's'} online in total, and claude-code/public reaches whichever of them opted in`
+      ? `No node of your own, so claude-code goes to a supporter. ${n} node${n === 1 ? '' : 's'} online in total`
       : 'Nothing is online, so neither claude-code nor claude-code/public has anybody to answer it'
   $('try-note').textContent = mine
     ? 'Goes to your own node, as claude-code.'
-    : 'No node of your own, so this sends claude-code/public and a stranger answers it.'
+    : 'No node of your own, so a supporter answers it.'
 }
 
 async function pollStatus() {

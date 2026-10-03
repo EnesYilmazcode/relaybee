@@ -129,8 +129,8 @@ console.log('\ne2e — failure (a): claude-code with no supporter online -> clea
   // a caller gets told to retry into a supporter who is already answering.
   // "nobody at all" and "nobody of yours" carry opposite advice, and the relay
   // now routes to the caller's own nodes, so the accurate message is the second.
-  t('the 504 names the real reason: no node of your own', /no node of your own/i.test(j.error?.message ?? ''), j.error?.message)
-  t('and it offers the public pool as the way out', /claude-code[/]public/.test(j.error?.message ?? ''))
+  t('the 504 names the real reason: no supporter online', /no supporter is online/i.test(j.error?.message ?? ''), j.error?.message)
+  t('and it says how to get an answer', /start one/.test(j.error?.message ?? ''))
   // This caller has now given up. Its job must leave with it, or the supporter
   // started further down would spend real model time answering nobody. That is
   // asserted after the worker has been running: see "abandoned job" below.
